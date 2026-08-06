@@ -1,0 +1,7 @@
+rfdetr[train,loggers]
+easyocr
+opencv-python-headless
+tensorrt
+onnx
+torch>=2.2.0
+torchvision>=0.17.0
