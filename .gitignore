@@ -1,0 +1,6 @@
+runs/
+crop_*.jpg
+__pycache__/
+*.pyc
+*.engine
+*.onnx
