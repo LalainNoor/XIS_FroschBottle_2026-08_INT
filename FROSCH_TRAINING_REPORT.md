@@ -76,9 +76,9 @@
 ## 4. Observations
 
 - **bottle** and **label** classes achieved near-perfect AP (~0.99), consistent across all epochs.
-- **capacity** (primary focus class) reached AP 0.7459 with high F1 (0.9642) and recall (0.9853), suitable for OCR post-processing.
+- **capacity** (primary focus class) reached AP 0.7459 with high F1 (0.9642) and recall (0.9853).
 - **damage** showed steady improvement, reaching AP 0.5863 by epoch 50.
-- **bump** and **scratch** performed poorly due to limited training samples (209 and 65 respectively). More annotated data would improve these classes.
+- **bump** and **scratch** performed poorly due to limited training samples (209 and 65 respectively).
 - Model converged steadily; EMA mAP improved from 0.0018 at epoch 0 to 0.6146 at epoch 49.
 
 ---
@@ -121,27 +121,54 @@
 - Matched against valid values: `{100, 300, 500}`
 - Prefix-based fallback for partial reads (`3xx→300`, `5xx→500`, `1xx→100`)
 
-### Test Results on 23 Images
+### Static Image Test Results (23 Images)
 
-| Bottle Type | Total Images | Correctly Detected |
+| Bottle Type | Total | Detected |
 |---|---|---|
 | 300 ml | 12 | 9 |
 | 500 ml | 7 | 7 |
 | 100 ml | 4 | 2 |
 
 **Overall detection rate:** ~78%  
-**Failure reason:** Partial occlusion or extreme angle causing capacity region to be cut off in crop.
+**Failure reason:** Partial occlusion or extreme angle causing capacity region to be cut off.
 
 ---
 
-## 8. Observations
+## 8. Live Inference Pipeline
 
-- **bottle** and **label** classes achieved near-perfect AP (~0.99), consistent across all epochs.
-- **capacity** (primary focus class) reached AP 0.7459 with high F1 (0.9642) and recall (0.9853).
-- **damage** showed steady improvement, reaching AP 0.5863 by epoch 50.
-- **bump** and **scratch** performed poorly due to limited training samples (209 and 65 respectively).
-- Model converged steadily; EMA mAP improved from 0.0018 at epoch 0 to 0.6146 at epoch 49.
-- OCR accuracy is limited by image quality (dark/grainy X-ray images) and angle variation.
+**Camera:** Allied Vision Vimba Camera Simulator  
+**CTI:** VimbaCameraSimulatorTL.cti  
+**Script:** `live_inference.py`  
+
+### Features
+- Real-time bottle detection and tracking using IoU-based tracker
+- OCR on capacity region — runs once on first appearance, retries on subsequent frames if not detected
+- Results logged to timestamped CSV file
+- Visual overlay on live feed
+
+### Inspection Checks Per Bottle
+
+| Check | Method |
+|---|---|
+| Capacity | EasyOCR on capacity crop |
+| Orientation | PASS if bottle height ≥ width, else FAIL |
+| H Center | PASS if label horizontal offset ≤ 15% of bottle width |
+| V Center | PASS if label vertical offset ≤ 15% of bottle height |
+| Defects | bump/damage detected via containment check |
+
+### Live Test Results (500ml bottles, 28 bottles)
+
+| Check | Result |
+|---|---|
+| Capacity detection rate | ~75% (improved with retry logic) |
+| Orientation | All PASS |
+| H Center | Mixed PASS/FAIL |
+| V Center | Mostly PASS |
+| Defect detection | bump detected on bottle #13 |
+
+### CSV Log Output
+Results saved to `results_YYYYMMDD_HHMMSS.csv` with columns:  
+`Bottle, Capacity, Orientation, H_Center, V_Center, Defects, Timestamp`
 
 ---
 
@@ -153,12 +180,13 @@
 | Best EMA Checkpoint | `runs/frosch_medium/` (epoch 49) |
 | ONNX Model | `runs/frosch_medium/rfdetr-medium.onnx` |
 | TensorRT Engine | `runs/frosch_medium/rfdetr-medium.engine` |
-| Inference Script | `inference.py` |
+| Image Inference Script | `inference.py` |
+| Live Inference Script | `live_inference.py` |
 
 ---
 
 ## 10. Recommendations
 
 - Re-annotate `bump` and `scratch` classes with more samples to improve recall.
-- Consider fine-tuning OCR on capacity region crops for better accuracy.
-- Inference intern to integrate segmentation + OCR pipeline for all 6 classes.
+- Improve camera angle/positioning to ensure capacity text is always fully visible.
+- Fine-tune OCR on capacity region crops for better accuracy on dark/grainy images.
