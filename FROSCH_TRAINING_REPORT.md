@@ -138,13 +138,22 @@
 
 **Camera:** Allied Vision Vimba Camera Simulator  
 **CTI:** VimbaCameraSimulatorTL.cti  
-**Script:** `live_inference.py`  
+**Script:** `live_inference.py`
 
 ### Features
-- Real-time bottle detection and tracking using IoU-based tracker
-- OCR on capacity region — runs once on first appearance, retries on subsequent frames if not detected
-- Results logged to timestamped CSV file
-- Visual overlay on live feed
+
+- Real-time bottle detection and tracking using an IoU-based tracker.
+- Each detected bottle receives a unique tracking ID.
+- Bottle inspection is performed once when a new bottle is detected.
+- OCR is performed on the detected capacity region.
+- Capacity OCR is retried on subsequent frames if the capacity is not detected initially.
+- Bottle orientation is checked using the detected bottle bounding-box dimensions.
+- Horizontal and vertical label centricity are checked relative to the bottle center.
+- Bump and damage detections are associated with the corresponding bottle.
+- Each bottle is classified as **Good** or **Defective** based on detected bump/damage defects.
+- Inspection results are displayed on the live visual overlay.
+- Cumulative Total, Good, and Defective bottle counters are displayed on the live feed.
+- Inspection results are logged to a timestamped CSV file.
 
 ### Inspection Checks Per Bottle
 
@@ -154,7 +163,31 @@
 | Orientation | PASS if bottle height ≥ width, else FAIL |
 | H Center | PASS if label horizontal offset ≤ 15% of bottle width |
 | V Center | PASS if label vertical offset ≤ 15% of bottle height |
-| Defects | bump/damage detected via containment check |
+| Defects | Bump/damage detected using containment check |
+| Status | Good if no bump/damage defects are detected; otherwise Defective |
+
+### Live Visual Overlay
+
+Each tracked bottle displays its inspection results on the live feed:
+
+    Good
+    Bottle #2
+    500 ml
+    O: PASS
+    H: PASS
+    V: PASS
+
+Where:
+
+- `O` = Bottle orientation
+- `H` = Horizontal label centricity
+- `V` = Vertical label centricity
+
+The top-left corner displays cumulative bottle counts:
+
+    Total: 10 | Good: 8 | Defective: 2
+
+The counters are cumulative and continue to include bottles after they leave the camera view.
 
 ### Live Test Results (500ml bottles, 28 bottles)
 
@@ -164,10 +197,16 @@
 | Orientation | All PASS |
 | H Center | Mixed PASS/FAIL |
 | V Center | Mostly PASS |
-| Defect detection | bump detected on bottle #13 |
+| Defect detection | Bump detected on bottle #13 |
 
 ### CSV Log Output
-Results saved to `results_YYYYMMDD_HHMMSS.csv` with columns:  
+
+Results are saved to:
+
+`results_YYYYMMDD_HHMMSS.csv`
+
+with columns:
+
 `Bottle, Capacity, Orientation, H_Center, V_Center, Defects, Timestamp`
 
 ---
@@ -187,6 +226,7 @@ Results saved to `results_YYYYMMDD_HHMMSS.csv` with columns:
 
 ## 10. Recommendations
 
-- Re-annotate `bump` and `scratch` classes with more samples to improve recall.
-- Improve camera angle/positioning to ensure capacity text is always fully visible.
-- Fine-tune OCR on capacity region crops for better accuracy on dark/grainy images.
+- Re-annotate `bump` and `scratch` classes with more samples to improve detection performance and recall.
+- Improve camera angle and positioning to ensure the capacity text is consistently visible.
+- Fine-tune OCR preprocessing and recognition for dark or grainy capacity regions.
+- Collect additional live-inference samples containing defective bottles to further evaluate bump and damage detection.

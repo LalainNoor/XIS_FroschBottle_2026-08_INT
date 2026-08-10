@@ -27,6 +27,9 @@ reader = easyocr.Reader(['en'], gpu=True)
 model = RFDETRMedium(pretrain_weights=CHECKPOINT)
 
 bottle_count = 0
+good_count = 0
+defective_count = 0
+
 next_track_id = 0
 tracked = []
 
@@ -286,6 +289,11 @@ try:
                     track["h_center"] = result["h_center"]
                     track["v_center"] = result["v_center"]
 
+                    if track["defects"]:
+                        defective_count += 1
+                    else:
+                        good_count += 1
+
                     # Print to terminal once
                     print("=" * 40)
                     print(f"Bottle #{bottle_count}")
@@ -319,34 +327,45 @@ try:
                 x1, y1, x2, y2 = track["box"]
 
                 cv2.putText(display, f"Bottle #{track['id'] + 1}",
-                            (x1, y1 - 55), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                            (x1, y1 - 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                status = "Defective" if track["defects"] else "Good"
+                col = (0, 0, 255) if status == "Defective" else (0, 255, 0)
+                cv2.putText(display, status,
+                            (x1, y1 - 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
 
                 if track["capacity"]:
                     cv2.putText(display, f"{track['capacity']} ml",
-                                (x1, y1 - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                                (x1, y1 - 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
                 if track["orientation"]:
                     col = (0, 255, 0) if track["orientation"] == "PASS" else (0, 0, 255)
-                    cv2.putText(display, f"Orient: {track['orientation']}",
-                                (x1, y2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                    cv2.putText(display, f"O: {track['orientation']}",
+                        (x1, y1 - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
                 if track["h_center"]:
                     col = (0, 255, 0) if track["h_center"] == "PASS" else (0, 0, 255)
-                    cv2.putText(display, f"H Center: {track['h_center']}",
-                                (x1, y2 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                    cv2.putText(display, f"H: {track['h_center']}",
+                        (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
                 if track["v_center"]:
                     col = (0, 255, 0) if track["v_center"] == "PASS" else (0, 0, 255)
-                    cv2.putText(display, f"V Center: {track['v_center']}",
-                                (x1, y2 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                    cv2.putText(display, f"V: {track['v_center']}",
+                        (x1, y1 - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
 
                 if track["defects"]:
                     cv2.putText(display, "Defects: " + ", ".join(track["defects"]),
-                                (x1, y2 + 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+                        (x1, y1 + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
             # Total bottle count overlay
-            cv2.putText(display, f"Total Bottles: {bottle_count}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            cv2.putText(
+                display,
+                f"Total: {bottle_count} | Good: {good_count} | Defective: {defective_count}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+            )
 
             display_resized = cv2.resize(display, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
             cv2.imshow("Frosch Inference", display_resized)
