@@ -77,6 +77,19 @@ MIN_BOTTLE_AREA = 20000 px²
 
 The best complete detection is updated when a better valid bottle-area snapshot is available.
 
+## Complete Defect Snapshot
+
+For defective bottles, the pipeline prefers a saved frame that contains:
+
+1. the complete bottle,
+2. the confirmed defect annotation,
+3. the corresponding bottle/label geometry,
+4. the associated segmentation/orientation information.
+
+If the exact confirmation frame is partially clipped, a complete defect snapshot or complete bottle snapshot is preferred for the final saved annotation.
+
+This prevents saved defective bottles from being unnecessarily cropped while preserving the visual defect annotation.
+
 ## 5. Finalization Conditions
 
 A bottle can be finalized in two ways.
@@ -301,3 +314,4 @@ This confirms that the three-way status directory structure is used by the curre
 - [x] Preserve segmentation contour for annotated output
 - [x] Prefer a confirmed-defect frame for defective samples
 - [x] Keep missing measurements distinct from FAIL measurements
+

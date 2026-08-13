@@ -1,7 +1,8 @@
+numpy>=1.24
+opencv-python>=4.8
+easyocr>=1.7
+rfdetr
+harvesters
+torch
+torchvision
 rfdetr[train,loggers]
-easyocr
-opencv-python-headless
-tensorrt
-onnx
-torch>=2.2.0
-torchvision>=0.17.0

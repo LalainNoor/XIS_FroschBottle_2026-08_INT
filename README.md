@@ -524,4 +524,4 @@ See `.gitignore` for the repository rules.
 - [x] Separate output directories
 - [x] CSV result logging
 - [x] Live inspection visualization
-
+- [x] Validation on new 100 ml bottle type
