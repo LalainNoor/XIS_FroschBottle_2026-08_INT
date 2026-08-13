@@ -1,232 +1,234 @@
-# Frosch Bottle 5 — RF-DETR Medium Training Report
+# Frosch RF-DETR Training Report
 
-**Date:** 2026-08-05  
-**Intern:** Lalain  
-**Project:** Frosch Bottle Defect Detection  
-**Model:** RF-DETR Medium (Instance Segmentation)  
+## 1. Purpose
 
----
+This document records the RF-DETR models used by the Frosch bottle live-inspection pipeline.
 
-## 1. Dataset
+The live inference system uses two separate RF-DETR checkpoints:
 
-| Property | Value |
-|---|---|
-| Source | Roboflow — Frosch bottle 5 (v6) |
-| Format | COCO JSON Segmentation |
-| Total Images | 1,046 |
-| Splits | Train + Validation |
-| Classes | 6 |
+1. RF-DETR Medium for object detection.
+2. RF-DETR Medium instance segmentation for bottle-mask generation.
 
-### Class Distribution
+The segmentation model is used during live inference to obtain the actual bottle mask and calculate bottle orientation.
 
-| Class | Count |
-|---|---|
-| bottle | 1,035 |
-| label | 1,030 |
-| capacity | 955 |
-| bump | 209 |
-| damage | 72 |
-| scratch | 65 |
+## 2. Models Used by Live Inference
 
----
+| Model | Class | Checkpoint |
+|---|---|---|
+| Detection | `RFDETRMedium` | `runs/frosch_medium/checkpoint_best_regular.pth` |
+| Segmentation | `RFDETRSegMedium` | `runs/frosch_seg_medium/checkpoint_best_total.pth` |
 
-## 2. Training Configuration
+The current inference script loads both checkpoints independently.
+
+## 3. Detection Model
+
+The detection checkpoint is loaded with:
+
+```python
+model = RFDETRMedium(
+    pretrain_weights="runs/frosch_medium/checkpoint_best_regular.pth"
+)
+```
+
+The live detection threshold is:
+
+```text
+0.40
+```
+
+The detector provides the class-specific bounding boxes used by the inspection logic.
+
+The classes explicitly consumed by the current live script are:
+
+- `bottle`
+- `capacity`
+- `label`
+- `damage`
+- `bump`
+
+Runtime logs reported that the detection checkpoint contains 7 classes. The current inference code only uses the five class names above.
+
+### Detection metrics
+
+The available project material does not contain a verified final detection metric table for the checkpoint used by the current live script.
+
+Therefore, the following should not be invented:
+
+- mAP@0.50
+- mAP@0.50:0.95
+- precision
+- recall
+- F1
+- validation loss
+- test-set accuracy
+
+These values should be added only from the actual RF-DETR training/evaluation output.
+
+## 4. RF-DETR Segmentation Training
+
+### Training script
+
+The segmentation training script is designed specifically for the Frosch bottle COCO-segmentation dataset.
+
+It uses:
+
+```python
+from rfdetr import RFDETRSegMedium
+```
+
+and initializes:
+
+```python
+model = RFDETRSegMedium()
+```
+
+The segmentation model intentionally starts from its own COCO-pretrained segmentation weights.
+
+It does **not** load the detection checkpoint:
+
+```text
+runs/frosch_medium/checkpoint_best_regular.pth
+```
+
+This is important because the detection and segmentation models use different model architectures/checkpoint structures.
+
+### Training configuration
+
+The available training script defines these defaults:
 
 | Parameter | Value |
+|---|---:|
+| Architecture | RF-DETR Medium segmentation |
+| Epochs | `50` |
+| Batch size | `4` |
+| Gradient accumulation | `4` |
+| Training resolution | `432` |
+| Learning rate | `1e-4` |
+| Dataset root | `.` by default |
+| Output directory | `runs/frosch_seg_medium` |
+
+The corresponding training call is:
+
+```python
+model.train(
+    dataset_dir=str(dataset),
+    epochs=50,
+    batch_size=4,
+    grad_accum_steps=4,
+    lr=1e-4,
+    resolution=432,
+    output_dir="runs/frosch_seg_medium",
+)
+```
+
+### Reproducible command
+
+From the repository root, the training configuration can be reproduced with:
+
+```bash
+python train_frosch_segmentation.py \
+    --dataset . \
+    --output runs/frosch_seg_medium \
+    --epochs 50 \
+    --batch-size 4 \
+    --grad-accum-steps 4 \
+    --resolution 432 \
+    --lr 1e-4
+```
+
+## 5. Segmentation Checkpoint Used in Inference
+
+The current live script expects:
+
+```text
+runs/frosch_seg_medium/checkpoint_best_total.pth
+```
+
+and loads it using:
+
+```python
+seg_model = RFDETRSegMedium(
+    pretrain_weights=SEG_CHECKPOINT
+)
+```
+
+with:
+
+```text
+SEG_THRESHOLD = 0.30
+```
+
+## 6. How the Segmentation Output Is Used
+
+The segmentation model is not used to replace the detector.
+
+Instead:
+
+1. RF-DETR detection identifies the bottle bounding box.
+2. RF-DETR segmentation provides candidate bottle masks.
+3. The best segmentation mask is matched to the detector bottle box using IoU.
+4. The mask is resized to the full camera-frame resolution if necessary.
+5. The mask is constrained to the detector bounding box.
+6. The mask pixels are used to calculate bottle orientation.
+7. The same mask is used to validate whether damage/bump detections are actually on the bottle.
+
+This separation keeps tracking/class association based on the detector while using segmentation where pixel-level geometry is required.
+
+
+### Status
+
+| Metric / Artifact | Status |
 |---|---|
-| Model | RF-DETR Medium |
-| Epochs | 50 |
-| Batch Size | 4 |
-| Input Resolution | 576 (train), 736 (multi-scale) |
-| Optimizer | AdamW |
-| AMP | bfloat16 |
-| EMA | Enabled |
-| Hardware | NVIDIA RTX 5080 (16 GB VRAM) |
-| Framework | rfdetr 1.9.1, PyTorch 2.13.0, PyTorch Lightning 2.6.5 |
+| Training architecture | Available |
+| Training hyperparameters | Available |
+| Output directory | Available |
+| Inference checkpoint path | Available |
+| Train/validation loss curves | Pending training artifact |
+| mAP@0.50 | Pending evaluation artifact |
+| mAP@0.50:0.95 | Pending evaluation artifact |
+| IoU | Pending evaluation artifact |
+| Precision | Pending evaluation artifact |
+| Recall | Pending evaluation artifact |
+| F1 | Pending evaluation artifact |
+| Held-out test visualizations | Pending artifact |
 
+**Do not replace the Pending values with estimates.**
+
+## 7. Runtime Observations
+
+When loading the current checkpoints, RF-DETR runtime warnings have been observed concerning:
+
+- different positional encodings from DINOv2,
+- patch-size differences,
+- checkpoint/model class-count configuration,
+- missing `num_queries` / `group_detr` checkpoint arguments,
+- inference optimization.
+
+These warnings should be documented as runtime/environment observations rather than interpreted as model-quality metrics.
+
+The runtime also reported that the loaded RF-DETR model was not optimized for inference and suggested FP16 inference for higher GPU throughput.
+
+## 8. Relationship to the Inspection Pipeline
+
+The training outputs support the following inspection functions:
+
+```text
+Detection checkpoint
+    |
+    +--> bottle
+    +--> capacity
+    +--> label
+    +--> damage
+    +--> bump
+
+Segmentation checkpoint
+    |
+    +--> bottle mask
+            |
+            +--> orientation
+            |
+            +--> defect-on-bottle validation
+            |
+            +--> annotated visualization
 ---
 
-## 3. Results
-
-### Overall Best Metrics (Epoch 50 / Best EMA Epoch 49)
-
-| Metric | Value |
-|---|---|
-| mAP 50:95 (best regular) | 0.6050 |
-| mAP 50:95 (best EMA) | **0.6146** |
-| mAP@50 | 0.7772 |
-| mAP@75 | 0.6184 |
-| F1 | 0.7849 |
-| Precision | 0.8569 |
-| Recall | 0.7547 |
-
-### Per-Class Metrics (Final Epoch)
-
-| Class | AP 50:95 | AR | F1 | Precision | Recall |
-|---|---|---|---|---|---|
-| bottle | 0.9885 | 0.9961 | 0.9885 | 0.9837 | 0.9934 |
-| label | 0.9878 | 0.9921 | 0.9885 | 0.9837 | 0.9934 |
-| capacity | **0.7459** | 0.7894 | 0.9642 | 0.9439 | 0.9853 |
-| damage | 0.5863 | 0.6917 | 0.8333 | 0.8333 | 0.8333 |
-| bump | 0.2067 | 0.4047 | 0.5660 | 0.7143 | 0.4688 |
-| scratch | 0.0780 | 0.2821 | 0.2857 | 0.7143 | 0.1786 |
-
----
-
-## 4. Observations
-
-- **bottle** and **label** classes achieved near-perfect AP (~0.99), consistent across all epochs.
-- **capacity** (primary focus class) reached AP 0.7459 with high F1 (0.9642) and recall (0.9853).
-- **damage** showed steady improvement, reaching AP 0.5863 by epoch 50.
-- **bump** and **scratch** performed poorly due to limited training samples (209 and 65 respectively).
-- Model converged steadily; EMA mAP improved from 0.0018 at epoch 0 to 0.6146 at epoch 49.
-
----
-
-## 5. Saved Checkpoints
-
-| Checkpoint | Path |
-|---|---|
-| Best Regular | `runs/frosch_medium/checkpoint_best_regular.pth` |
-| Best EMA | `runs/frosch_medium/` (saved at epoch 49) |
-
----
-
-## 6. Model Export & TensorRT Conversion
-
-| Step | Output |
-|---|---|
-| ONNX Export | `runs/frosch_medium/rfdetr-medium.onnx` |
-| TensorRT Engine | `runs/frosch_medium/rfdetr-medium.engine` |
-| TensorRT Version | 10.14.1.48 |
-| Precision | FP16 |
-
----
-
-## 7. OCR Pipeline
-
-**Library:** EasyOCR (GPU)  
-**Target Class:** `capacity` only  
-**Input:** Cropped capacity region from segmentation output  
-
-### Preprocessing Steps
-- BGR to Grayscale conversion
-- 4x upscaling (INTER_CUBIC)
-- CLAHE contrast enhancement (clipLimit=3.0)
-- Otsu binarization
-- Digit-only allowlist (`0123456789`)
-
-### Capacity Extraction Logic
-- First 3 digits extracted from OCR output
-- Matched against valid values: `{100, 300, 500}`
-- Prefix-based fallback for partial reads (`3xx→300`, `5xx→500`, `1xx→100`)
-
-### Static Image Test Results (23 Images)
-
-| Bottle Type | Total | Detected |
-|---|---|---|
-| 300 ml | 12 | 9 |
-| 500 ml | 7 | 7 |
-| 100 ml | 4 | 2 |
-
-**Overall detection rate:** ~78%  
-**Failure reason:** Partial occlusion or extreme angle causing capacity region to be cut off.
-
----
-
-## 8. Live Inference Pipeline
-
-**Camera:** Allied Vision Vimba Camera Simulator  
-**CTI:** VimbaCameraSimulatorTL.cti  
-**Script:** `live_inference.py`
-
-### Features
-
-- Real-time bottle detection and tracking using an IoU-based tracker.
-- Each detected bottle receives a unique tracking ID.
-- Bottle inspection is performed once when a new bottle is detected.
-- OCR is performed on the detected capacity region.
-- Capacity OCR is retried on subsequent frames if the capacity is not detected initially.
-- Bottle orientation is checked using the detected bottle bounding-box dimensions.
-- Horizontal and vertical label centricity are checked relative to the bottle center.
-- Bump and damage detections are associated with the corresponding bottle.
-- Each bottle is classified as **Good** or **Defective** based on detected bump/damage defects.
-- Inspection results are displayed on the live visual overlay.
-- Cumulative Total, Good, and Defective bottle counters are displayed on the live feed.
-- Inspection results are logged to a timestamped CSV file.
-
-### Inspection Checks Per Bottle
-
-| Check | Method |
-|---|---|
-| Capacity | EasyOCR on capacity crop |
-| Orientation | PASS if bottle height ≥ width, else FAIL |
-| H Center | PASS if label horizontal offset ≤ 15% of bottle width |
-| V Center | PASS if label vertical offset ≤ 15% of bottle height |
-| Defects | Bump/damage detected using containment check |
-| Status | Good if no bump/damage defects are detected; otherwise Defective |
-
-### Live Visual Overlay
-
-Each tracked bottle displays its inspection results on the live feed:
-
-    Good
-    Bottle #2
-    500 ml
-    O: PASS
-    H: PASS
-    V: PASS
-
-Where:
-
-- `O` = Bottle orientation
-- `H` = Horizontal label centricity
-- `V` = Vertical label centricity
-
-The top-left corner displays cumulative bottle counts:
-
-    Total: 10 | Good: 8 | Defective: 2
-
-The counters are cumulative and continue to include bottles after they leave the camera view.
-
-### Live Test Results (500ml bottles, 28 bottles)
-
-| Check | Result |
-|---|---|
-| Capacity detection rate | ~75% (improved with retry logic) |
-| Orientation | All PASS |
-| H Center | Mixed PASS/FAIL |
-| V Center | Mostly PASS |
-| Defect detection | Bump detected on bottle #13 |
-
-### CSV Log Output
-
-Results are saved to:
-
-`results_YYYYMMDD_HHMMSS.csv`
-
-with columns:
-
-`Bottle, Capacity, Orientation, H_Center, V_Center, Defects, Timestamp`
-
----
-
-## 9. Saved Files
-
-| File | Path |
-|---|---|
-| Best Regular Checkpoint | `runs/frosch_medium/checkpoint_best_regular.pth` |
-| Best EMA Checkpoint | `runs/frosch_medium/` (epoch 49) |
-| ONNX Model | `runs/frosch_medium/rfdetr-medium.onnx` |
-| TensorRT Engine | `runs/frosch_medium/rfdetr-medium.engine` |
-| Image Inference Script | `inference.py` |
-| Live Inference Script | `live_inference.py` |
-
----
-
-## 10. Recommendations
-
-- Re-annotate `bump` and `scratch` classes with more samples to improve detection performance and recall.
-- Improve camera angle and positioning to ensure the capacity text is consistently visible.
-- Fine-tune OCR preprocessing and recognition for dark or grainy capacity regions.
-- Collect additional live-inference samples containing defective bottles to further evaluate bump and damage detection.

@@ -1,6 +1,71 @@
-runs/
-crop_*.jpg
+# Python
 __pycache__/
-*.pyc
-*.engine
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime logs
+*.log
+
+# Generated inference output
+results/
+outputs/
+debug/
+runs/*/inference/
+runs/*/predictions/
+
+# Model checkpoints / large model artifacts
+*.pth
+*.pt
+*.ckpt
 *.onnx
+*.engine
+*.trt
+
+# Camera / vendor SDK artifacts
+*.cti
+*.dll
+*.so
+*.lib
+
+# Local machine configuration
+.env
+.env.*
+*.local
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Keep Git metadata and source documentation
+!README.md
+!FROSCH_TRAINING_REPORT.md
+!FROSHC_BOTTLE_IMAGE_SAVING.md
+!RESULTS.md
+!requirements.txt
