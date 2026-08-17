@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import re
 import os
+import argparse
 import easyocr
 from rfdetr import RFDETRMedium, RFDETRSegMedium
 from harvesters.core import Harvester
@@ -17,13 +18,42 @@ with open(LOG_FILE, 'w', newline='') as f:
     writer.writerow(['Bottle', 'Capacity', 'Orientation', 'H_Center', 'V_Center', 'Defects', 'Timestamp'])
 
 # -----------------------------
+# Runtime arguments / configuration
+# -----------------------------
+def parse_runtime_args():
+    parser = argparse.ArgumentParser(
+        description="Frosch bottle live/folder inference pipeline"
+    )
+    parser.add_argument(
+        "--input",
+        "--input-mode",
+        dest="input_mode",
+        choices=("camera", "folder"),
+        default="camera",
+        help="Input source: camera (default) or folder",
+    )
+    parser.add_argument(
+        "--frame-dir",
+        default="/home/xisai/Downloads/Capture_2026-07-15_07h53m14s",
+        help="Folder containing recorded frames when --input folder is used",
+    )
+    parser.add_argument(
+        "--expected-capacity",
+        type=int,
+        choices=(100, 300, 500),
+        default=100,
+        help="Expected bottle capacity for the currently tested bottle type",
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_runtime_args()
+
+# -----------------------------
 # Configuration
 # -----------------------------
-# Input source
-INPUT_MODE = "camera"
-
-# Folder containing the new frames
-FRAME_DIR = "/home/xisai/Downloads/Capture_2026-07-15_07h53m14s"
+INPUT_MODE = ARGS.input_mode
+FRAME_DIR = ARGS.frame_dir
 
 CHECKPOINT = "runs/frosch_medium/checkpoint_best_regular.pth"
 SEG_CHECKPOINT = "runs/frosch_seg_medium/checkpoint_best_total.pth"
@@ -51,7 +81,7 @@ NEW_BOTTLE_V_CENTRICITY_THRESH = 0.20
 NEW_BOTTLE_ASPECT_RATIO_MAX = 0.45
 
 # Expected capacity for the bottle type currently being tested.
-EXPECTED_CAPACITY = 100
+EXPECTED_CAPACITY = ARGS.expected_capacity
 
 LABEL_CONTAINMENT_TOLERANCE = 10
 
