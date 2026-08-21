@@ -2,72 +2,61 @@
 
 ## 1. Purpose
 
-The live inference pipeline saves a finalized bottle as a pair of images:
+The final live inference pipeline saves each finalized bottle as a pair of images:
 
-1. `original.jpg` — clean bottle crop.
+1. `original.jpg` — clean selected bottle crop.
 2. `annotated.jpg` — the same selected bottle crop with inspection annotations.
 
-The current implementation saves bottles into separate directories according to their final inspection status.
+Bottles are organized first by capacity and then by final inspection status.
 
 ## 2. Output Structure
 
 ```text
 saved_bottles/
-├── good/
-│   └── bottle_001/
-│       ├── original.jpg
-│       └── annotated.jpg
-├── defective/
-│   └── bottle_002/
-│       ├── original.jpg
-│       └── annotated.jpg
-└── incomplete/
-    └── bottle_003/
-        ├── original.jpg
-        └── annotated.jpg
+├── 100ml/
+│   ├── good/
+│   │   └── bottle_001/
+│   │       ├── original.jpg
+│   │       └── annotated.jpg
+│   ├── defective/
+│   └── incomplete/
+├── 300ml/
+│   ├── good/
+│   ├── defective/
+│   └── incomplete/
+└── 500ml/
+    ├── good/
+    ├── defective/
+    └── incomplete/
 ```
 
-The category is derived from the final status:
+The status category is derived from the final result:
 
 ```text
-GOOD       -> saved_bottles/good/
-DEFECTIVE  -> saved_bottles/defective/
-INCOMPLETE -> saved_bottles/incomplete/
+GOOD       -> <capacity>/good/
+DEFECTIVE  -> <capacity>/defective/
+INCOMPLETE -> <capacity>/incomplete/
 ```
 
 ## 3. Exactly-Once Saving
 
-Each track contains:
+Each track maintains a saved state.
 
-```python
-track["saved"]
-```
+After the bottle's image pair is successfully written, the track is marked as saved and is not written again.
 
-The save function immediately returns when the track has already been saved.
-
-After both image files are successfully written:
-
-```python
-track["saved"] = True
-```
-
-The track is then removed from the active tracking list.
-
-This prevents the same active bottle track from generating repeated image pairs across subsequent frames.
+This prevents repeated image pairs for the same tracked bottle.
 
 ## 4. Bottle Selection
 
 The pipeline does not simply save the first frame in which a bottle is detected.
 
-A complete bottle snapshot is required.
+It prefers a complete and valid bottle snapshot that:
 
-The selected detection must:
-
-- have a valid complete bounding box,
-- be inside the frame,
-- satisfy the minimum bottle-area requirement,
-- have a valid segmentation/orientation snapshot when one is available,
-- preserve the frame and associated annotation data together.
+- has a valid bottle bounding box,
+- is sufficiently inside the frame,
+- satisfies the minimum bottle-area requirement,
+- preserves the corresponding annotations,
+- retains valid segmentation/orientation information when available.
 
 The current minimum bottle area is:
 
@@ -75,20 +64,7 @@ The current minimum bottle area is:
 MIN_BOTTLE_AREA = 20000 px²
 ```
 
-The best complete detection is updated when a better valid bottle-area snapshot is available.
-
-## Complete Defect Snapshot
-
-For defective bottles, the pipeline prefers a saved frame that contains:
-
-1. the complete bottle,
-2. the confirmed defect annotation,
-3. the corresponding bottle/label geometry,
-4. the associated segmentation/orientation information.
-
-If the exact confirmation frame is partially clipped, a complete defect snapshot or complete bottle snapshot is preferred for the final saved annotation.
-
-This prevents saved defective bottles from being unnecessarily cropped while preserving the visual defect annotation.
+A complete-frame snapshot is retained separately from defect snapshots so that the final saved crop can remain visually useful.
 
 ## 5. Finalization Conditions
 
@@ -96,101 +72,88 @@ A bottle can be finalized in two ways.
 
 ### Trigger-line crossing
 
-The current trigger line is:
-
 ```text
-40% of the frame width
-```
-
-with:
-
-```text
+TRIGGER_LINE_X_RATIO = 0.40
 TRIGGER_LINE_TOLERANCE = 20 px
 ```
 
-When the tracked bottle center crosses this line, the bottle is finalized immediately.
+When the tracked bottle center crosses the trigger line, its accumulated result is finalized.
 
 ### Missing-frame fallback
 
-If the bottle is no longer detected for:
+If the bottle is not detected for:
 
 ```text
 MAX_MISSING_FRAMES = 20
 ```
 
-frames, the bottle is finalized through the missing-frame fallback.
+frames, the track is finalized through the missing-frame fallback.
 
-This allows the image-saving logic to continue working if the trigger-line event is not reached.
+## 6. Defect Snapshot Preference
 
-## 6. Crop Padding
+For a DEFECTIVE bottle, the saving logic prefers a frame that contains:
 
-The selected bottle crop is expanded by:
+1. the complete bottle,
+2. the confirmed defect information,
+3. the corresponding label/bottle geometry,
+4. the segmentation/orientation data.
+
+If the exact defect-confirmation frame is partially clipped, the implementation falls back to a complete saved bottle snapshot and/or preserved defect boxes.
+
+This keeps the final bottle crop complete while preserving defect visualization where possible.
+
+## 7. Crop Padding
+
+The selected crop is expanded by:
 
 ```text
 SAVE_PADDING = 20 px
 ```
 
-where image boundaries allow it.
+where the frame boundaries allow it.
 
-Therefore, the saved crop contains a small amount of context around the bottle.
+The crop is clipped to the actual frame. No image content is fabricated.
 
-No missing image content is fabricated; the crop is clipped to the actual frame boundaries.
+## 8. Original Image
 
-## 7. Original Image
+`original.jpg` is generated before annotations are drawn.
 
-`original.jpg` is generated from the selected crop before annotation.
+It is intended to remain a clean sample of the selected bottle crop.
 
-It does not intentionally add:
-
-- bottle bounding boxes,
-- bottle ID text,
-- status text,
-- label graphics,
-- centricity lines,
-- defect labels,
-- orientation axes.
-
-It is intended to be the clean sample corresponding to the annotated result.
-
-## 8. Annotated Image
+## 9. Annotated Image
 
 `annotated.jpg` is generated from the same selected crop.
 
-Depending on the available data, the annotation contains:
+Depending on the available information, the annotation can contain:
 
-- Bottle ID
-- final status
-- capacity
-- orientation
-- H Center
-- V Center
-- defect list
-- bottle bounding box
-- bottle segmentation contour
-- orientation axes
-- label bounding box
-- label center marker
-- H/V centricity guide lines
-- damage boxes
-- bump boxes
+- bottle bounding box,
+- bottle ID,
+- final status,
+- capacity,
+- orientation,
+- H Center,
+- V Center,
+- defect list,
+- bottle segmentation contour,
+- orientation axes,
+- label bounding box,
+- label center marker,
+- H/V centricity guide lines,
+- damage boxes,
+- bump boxes.
 
-The segmentation contour is transformed from full-frame coordinates into crop-local coordinates before drawing.
+The bottle segmentation contour and geometry are converted from full-frame coordinates into crop-local coordinates before drawing.
 
-## 9. Defective Samples
+## 10. Defective Samples
 
-A bottle is classified as DEFECTIVE when at least one required inspection check fails or a confirmed defect exists.
+A bottle is stored under `defective/` when:
+
+- orientation fails,
+- H centricity fails,
+- V centricity fails,
+- or a confirmed defect exists.
 
 Examples:
-
-```text
-Orientation: FAIL
-H Center: PASS
-V Center: PASS
-Defects: None
-Status: DEFECTIVE
-```
-
-or:
 
 ```text
 Orientation: PASS
@@ -203,23 +166,20 @@ Status: DEFECTIVE
 or:
 
 ```text
-Defects: bump, damage
+Orientation: PASS
+H Center: FAIL
+V Center: PASS
+Defects: None
 Status: DEFECTIVE
 ```
 
-The image is stored under:
+## 11. Incomplete Samples
 
-```text
-saved_bottles/defective/
-```
+An INCOMPLETE bottle is not automatically defective.
 
-## 10. Incomplete Samples
+It is used when a required measurement remains unavailable/Pending at finalization.
 
-An INCOMPLETE bottle is not automatically treated as defective.
-
-The current finalization logic uses INCOMPLETE when required measurements remain unavailable/Pending.
-
-For example:
+Example:
 
 ```text
 Orientation: Pending
@@ -229,23 +189,35 @@ Defects: None
 Status: INCOMPLETE
 ```
 
-The image is stored under:
+The sample is stored under the capacity-specific `incomplete/` directory.
+
+## 12. Capacity-Specific Saving
+
+The current inference script creates:
 
 ```text
-saved_bottles/incomplete/
+saved_bottles/<expected-capacity>ml/
 ```
 
-This distinction is important because missing measurements and failed measurements represent different conditions.
+using the `--expected-capacity` argument.
 
-## 11. Defect Frame Preference
+Supported values:
 
-When a confirmed defect exists, the saving logic prefers a frame that actually contains the confirmed defect information.
+```text
+100
+300
+500
+```
 
-If a defect frame is unavailable, the implementation falls back to the best complete bottle snapshot and/or preserved defect boxes where possible.
+For example:
 
-For GOOD bottles, the best complete snapshot is used.
+```text
+saved_bottles/100ml/good/
+saved_bottles/300ml/defective/
+saved_bottles/500ml/incomplete/
+```
 
-## 12. One Bottle = Two Images
+## 13. One Bottle = Two Images
 
 For every successfully saved bottle:
 
@@ -253,54 +225,46 @@ For every successfully saved bottle:
 1 bottle -> 2 image files
 ```
 
-For example:
+Example:
 
 ```text
-bottle_024/
+bottle_018/
 ├── original.jpg
 └── annotated.jpg
 ```
 
-This makes the saved dataset convenient for later visual review, debugging, and sample collection.
+## 14. Runtime Verification
 
-## 13. Runtime Verification
-
-Recorded inference runs show the expected output pattern.
-
-For example, a GOOD bottle was saved as:
+The final recorded validation logs show the expected saving pattern for all three bottle types, including:
 
 ```text
-saved_bottles/good/bottle_031/original.jpg
-saved_bottles/good/bottle_031/annotated.jpg
+saved_bottles/500ml/good/
+saved_bottles/500ml/defective/
+saved_bottles/500ml/incomplete/
 ```
-
-A DEFECTIVE bottle was saved as:
 
 ```text
-saved_bottles/defective/bottle_052/original.jpg
-saved_bottles/defective/bottle_052/annotated.jpg
+saved_bottles/300ml/good/
+saved_bottles/300ml/defective/
 ```
-
-An INCOMPLETE bottle was also observed under:
 
 ```text
-saved_bottles/incomplete/
+saved_bottles/100ml/good/
+saved_bottles/100ml/defective/
 ```
 
-This confirms that the three-way status directory structure is used by the current implementation.
-
-## 14. Current Saving Parameters
+## 15. Current Saving Parameters
 
 | Parameter | Value |
 |---|---:|
-| Save directory | `./saved_bottles` |
+| Save root | `./saved_bottles` |
 | Save padding | `20 px` |
 | Minimum bottle area | `20000 px²` |
 | Missing-frame finalization | `20 frames` |
 | Trigger line | `40%` frame width |
 | Trigger tolerance | `20 px` |
 
-## 15. Verification Checklist
+## 16. Verification Checklist
 
 - [x] Save complete bottle crop
 - [x] Save clean/original image
@@ -309,9 +273,9 @@ This confirms that the three-way status directory structure is used by the curre
 - [x] Separate GOOD images
 - [x] Separate DEFECTIVE images
 - [x] Separate INCOMPLETE images
-- [x] Save each active track only once
-- [x] Preserve selected frame with its annotation data
+- [x] Organize output by bottle capacity
+- [x] Save each track only once
+- [x] Preserve selected frame with annotation data
 - [x] Preserve segmentation contour for annotated output
-- [x] Prefer a confirmed-defect frame for defective samples
+- [x] Prefer a complete defect snapshot for defective samples
 - [x] Keep missing measurements distinct from FAIL measurements
-

@@ -11,12 +11,6 @@ import csv
 from datetime import datetime
 from collections import Counter
 
-LOG_FILE = f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-
-with open(LOG_FILE, 'w', newline='') as f:
-    writer = csv.writer(f)
-    writer.writerow(['Bottle', 'Capacity', 'Orientation', 'H_Center', 'V_Center', 'Defects', 'Timestamp'])
-
 # -----------------------------
 # Runtime arguments / configuration
 # -----------------------------
@@ -46,8 +40,20 @@ def parse_runtime_args():
     )
     return parser.parse_args()
 
-
 ARGS = parse_runtime_args()
+
+LOG_FILE = f"results_{ARGS.expected_capacity}ml.csv"
+with open(LOG_FILE, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "Bottle",
+        "Capacity",
+        "Orientation",
+        "H_Center",
+        "V_Center",
+        "Defects",
+        "Timestamp",
+    ])
 
 # -----------------------------
 # Configuration
@@ -58,6 +64,19 @@ FRAME_DIR = ARGS.frame_dir
 CHECKPOINT = "runs/frosch_medium/checkpoint_best_regular.pth"
 SEG_CHECKPOINT = "runs/frosch_seg_medium/checkpoint_best_total.pth"
 SEG_THRESHOLD = 0.30
+
+# Per-class confidence thresholds (overrides universal THRESHOLD / SEG_THRESHOLD).
+# Lower  → more recall, more false positives.
+# Higher → fewer false positives, more misses.
+PER_CLASS_CONF = {
+    "bottle":   0.70,   # was 0.40 - filters person FP (conf~0.43)
+    "label":    0.35,
+    "capacity": 0.35,
+    "bump":     0.50,   # was 0.25, and than 0.35 - raise to cut 500ml #17 FP
+    "damage":   0.30,   # was 0.45 - lower to catch 100ml #17 missed
+    "scratch":  0.30,   # undertrained – lower to catch more
+}
+
 BOTTLE_CLASS_NAME = "bottle"
 ORIENTATION_MAX_ANGLE_DEG = 45.0
 CTI_PATH = "/home/xisai/Downloads/VimbaX_2026-2/cti/VimbaCameraSimulatorTL.cti"
@@ -69,19 +88,40 @@ MAX_MISSING_FRAMES = 20
 TRIGGER_LINE_X_RATIO = 0.40
 TRIGGER_LINE_TOLERANCE = 20
 
-H_CENTRICITY_THRESH = 0.15
-V_CENTRICITY_THRESH = 0.15
-# New bottle type:
-# Its normal label position produces a V offset of approximately
-# 0.183 - 0.185, so allow a slightly larger V tolerance.
-NEW_BOTTLE_V_CENTRICITY_THRESH = 0.20
+# A centricity measurement is considered reliable only when
+# the bottle is sufficiently away from the left/right frame edges.
+COMPLETE_X_MARGIN = 20
 
-# New bottle is noticeably narrower relative to its height.
-# This keeps the original bottle's V threshold unchanged.
-NEW_BOTTLE_ASPECT_RATIO_MAX = 0.45
+H_CENTRICITY_THRESH = 0.15
+
+# Expected V centricity for each bottle type.
+BOTTLE_TYPE1_EXPECTED_V = 0.01   # 500 ml
+BOTTLE_TYPE2_EXPECTED_V = 0.12   # 100 ml
+BOTTLE_TYPE3_EXPECTED_V = 0.07   # 300 ml
+
+V_DEVIATION_THRESH = 0.05
 
 # Expected capacity for the bottle type currently being tested.
 EXPECTED_CAPACITY = ARGS.expected_capacity
+
+# Preserve the existing camera/folder workflow while selecting
+# the correct V reference for each bottle capacity.
+if EXPECTED_CAPACITY == 500:
+    BOTTLE_TYPE = 1
+    EXPECTED_V = BOTTLE_TYPE1_EXPECTED_V
+
+elif EXPECTED_CAPACITY == 100:
+    BOTTLE_TYPE = 2
+    EXPECTED_V = BOTTLE_TYPE2_EXPECTED_V
+
+elif EXPECTED_CAPACITY == 300:
+    BOTTLE_TYPE = 3
+    EXPECTED_V = BOTTLE_TYPE3_EXPECTED_V
+
+else:
+    raise ValueError(
+        f"Unsupported bottle capacity: {EXPECTED_CAPACITY}"
+    )
 
 LABEL_CONTAINMENT_TOLERANCE = 10
 
@@ -92,6 +132,9 @@ CENTRICITY_SPATIAL_TOLERANCE = 0.08
 CENTRICITY_MIN_HISTORY = 3
 CENTRICITY_HISTORY_WINDOW = 5
 
+# Minimum number of reliable complete-frame observations
+# required before H/V centricity can determine the result.
+MIN_RELIABLE_CENTRICITY_MEASUREMENTS = 3
 # -----------------------------
 # Classification Rules
 # -----------------------------
@@ -101,12 +144,22 @@ CENTRICITY_HISTORY_WINDOW = 5
 DEFECT_OVERLAP_THRESH = 0.3   # defect box must overlap bottle mask by this fraction to count
 # A defect must be detected in consecutive frames before it is accepted.
 # This reduces one-frame false positives from the defect detector.
-DEFECT_CONFIRMATION_FRAMES = 2
+DEFECT_CONFIRMATION_FRAMES = 1
+
+# Allow a confirmed candidate to survive a short detector miss.
+# This handles intermittent bump/damage detections between frames.
+DEFECT_MAX_MISSING_FRAMES = 1
 # FIX 1: minimum bottle area to avoid saving spurious/partial detections
 MIN_BOTTLE_AREA = 20000
 
-SAVE_DIR = os.path.join(os.getcwd(), "saved_bottles")
+SAVE_ROOT_DIR = os.path.join(os.getcwd(), "saved_bottles")
+SAVE_DIR = os.path.join(
+    SAVE_ROOT_DIR,
+    f"{EXPECTED_CAPACITY}ml",
+)
+
 SAVE_PADDING = 20
+
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 reader = easyocr.Reader(['en'], gpu=True)
@@ -374,7 +427,7 @@ def find_bottle_mask(bottle_box, segmentation_detections):
     for i, cls in enumerate(class_names):
         if cls != BOTTLE_CLASS_NAME:
             continue
-        if float(segmentation_detections.confidence[i]) < SEG_THRESHOLD:
+        if float(segmentation_detections.confidence[i]) < PER_CLASS_CONF.get(BOTTLE_CLASS_NAME, SEG_THRESHOLD):
             continue
 
         seg_box = tuple(map(int, segmentation_detections.xyxy[i]))
@@ -386,6 +439,31 @@ def find_bottle_mask(bottle_box, segmentation_detections):
 
     return best_mask
 
+def get_mask_centroid(mask):
+    if mask is None:
+        return None
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        return None
+    return (float(xs.mean()), float(ys.mean()))
+
+def find_label_mask(bottle_box, seg_detections, frame):
+    if seg_detections is None or seg_detections.mask is None:
+        return None
+    best_mask, best_score = None, 0.0
+    for i, cls in enumerate(seg_detections.data.get("class_name", [])):
+        if cls != "label":
+            continue
+        if float(seg_detections.confidence[i]) < PER_CLASS_CONF.get("label", SEG_THRESHOLD):
+            continue
+        score = iou(bottle_box, tuple(map(int, seg_detections.xyxy[i])))
+        if score > best_score:
+            best_score = score
+            best_mask = seg_detections.mask[i]
+    if best_mask is None:
+        return None
+    best_mask = resize_mask_to_frame(best_mask, frame)
+    return constrain_mask_to_box(best_mask, bottle_box)
 
 def resize_mask_to_frame(mask, frame):
     """Resize seg model mask to match frame resolution."""
@@ -472,32 +550,60 @@ def draw_mask_orientation(image, orientation_data, color=(255, 0, 0), thickness=
     cv2.line(image, q1, q2, color, max(1, thickness - 1), cv2.LINE_AA)
     cv2.drawMarker(image, (cx, cy), color, cv2.MARKER_CROSS, 18, 2)
 
-def check_centricity(bottle_box, label_box):
-    bx, by = box_center(bottle_box)
-    lx, ly = box_center(label_box)
+def is_reliable_bottle_frame(box, frame_shape):
+    """
+    Return True only when the bottle is sufficiently inside
+    the camera frame to provide a reliable centricity measurement.
+    """
+    frame_h, frame_w = frame_shape[:2]
+    x1, y1, x2, y2 = map(int, box)
+
+    return (
+        x1 >= COMPLETE_X_MARGIN
+        and x2 <= frame_w - COMPLETE_X_MARGIN
+        and y1 >= 0
+        and y2 <= frame_h
+    )
+
+def check_centricity(
+    bottle_box,
+    label_box,
+    bottle_mask=None,
+    label_mask=None,
+):
+    """
+    Calculate centricity from segmentation-mask centroids.
+
+    Masks are the primary source for bottle/label centers so the same
+    geometry is used for both bottle types. Bounding-box centers are only
+    used as a fallback when a corresponding mask is unavailable.
+    """
+    bottle_c = get_mask_centroid(bottle_mask)
+    label_c = get_mask_centroid(label_mask)
+
+    bx, by = bottle_c if bottle_c is not None else box_center(bottle_box)
+    lx, ly = label_c if label_c is not None else box_center(label_box)
 
     bw = max(1.0, float(bottle_box[2] - bottle_box[0]))
     bh = max(1.0, float(bottle_box[3] - bottle_box[1]))
 
-    h_offset = abs(lx - bx) / bw
-    v_offset = abs(ly - by) / bh
+    h_offset = (lx - bx) / bw
+    v_offset = (ly - by) / bh
 
-    # Keep the original H-centering rule unchanged.
-    h_ok = h_offset <= H_CENTRICITY_THRESH
+    h_ok = abs(h_offset) <= H_CENTRICITY_THRESH
 
-    # Detect the narrower/taller new bottle geometry.
-    bottle_aspect_ratio = bw / bh
-
-    if bottle_aspect_ratio <= NEW_BOTTLE_ASPECT_RATIO_MAX:
-        v_threshold = NEW_BOTTLE_V_CENTRICITY_THRESH
-    else:
-        v_threshold = V_CENTRICITY_THRESH
-
-    v_ok = v_offset <= v_threshold
+    v_ok = (
+        abs(v_offset - EXPECTED_V)
+        <= V_DEVIATION_THRESH
+    )
 
     return (
         "PASS" if h_ok else "FAIL",
         "PASS" if v_ok else "FAIL",
+        h_offset,
+        v_offset,
+        (bx, by),
+        (lx, ly),
     )
 
 def has_crossed_trigger_line(track, box, frame_width):
@@ -542,6 +648,10 @@ def create_track(box):
         "capacity": None,
         "defects": [],
         "defect_streaks": {
+            "damage": 0,
+            "bump": 0,
+        },
+        "defect_missing_frames": {
             "damage": 0,
             "bump": 0,
         },
@@ -600,6 +710,14 @@ def create_track(box):
         "h_history": [],
         "v_history": [],
         "orientation_history": [],
+        # Numeric measurements retained separately from PASS/FAIL histories.
+        # H/V values are absolute normalized label-to-bottle center offsets.
+        "h_value_history": [],
+        "v_value_history": [],
+        "orientation_angle_history": [],
+        "final_h_value": None,
+        "final_v_value": None,
+        "final_orientation_angle": None,
         "capacity_history": [],
         "finalized": False,
         "final_status": None,
@@ -626,31 +744,112 @@ def stable_result(values):
     return result
 
 
+def stable_numeric(values):
+    """Return a robust representative numeric measurement."""
+    clean = [
+        float(v)
+        for v in values
+        if v is not None and np.isfinite(float(v))
+    ]
+
+    if not clean:
+        return None
+
+    return float(np.median(clean))
+
+
+def format_measurement(value, status, suffix=""):
+    """Format a numeric measurement with its existing PASS/FAIL status."""
+    if value is None:
+        return status or "N/A"
+
+    if status in {"PASS", "FAIL"}:
+        return f"{value:.3f}{suffix} ({status})"
+
+    return f"{value:.3f}{suffix} ({status or 'N/A'})"
+
+
 def finalize_measurements(track):
     """Freeze the final bottle state from accumulated observations."""
-    h = stable_result(track.get("h_history", []))
-    v = stable_result(track.get("v_history", []))
-    orientation = majority_result(track.get("orientation_history", []))
+    h_values = [
+        abs(float(x))
+        for x in track.get("h_value_history", [])
+        if x is not None and np.isfinite(float(x))
+    ]
 
-    # Final capacity rule for the current bottle type.
-    # OCR is still used for recognition, but the known product
-    # specification takes priority over an ambiguous OCR result.
-    if EXPECTED_CAPACITY is not None:
-        track["capacity"] = EXPECTED_CAPACITY
-    else:
-        capacity = stable_capacity(
-            track.get("capacity_history", [])
+    v_values = [
+        abs(float(x))
+        for x in track.get("v_value_history", [])
+        if x is not None and np.isfinite(float(x))
+    ]
+
+    if h_values:
+        h = (
+            "PASS"
+            if float(np.median(h_values)) <= H_CENTRICITY_THRESH
+            else "FAIL"
         )
+    else:
+        h = "Pending"
 
-        if capacity is not None:
-            track["capacity"] = capacity
+    if v_values:
+        v = (
+            "PASS"
+            if abs(float(np.median(v_values)) - EXPECTED_V)
+            <= V_DEVIATION_THRESH
+            else "FAIL"
+        )
+    else:
+        v = "Pending"
 
-    if h is not None:
-        track["h_center"] = h
-    if v is not None:
-        track["v_center"] = v
-    if orientation is not None:
-        track["orientation"] = orientation
+    # Fallback: if still Pending but a saved complete label box exists,
+    # compute a one-shot centricity so the bottle is not left INCOMPLETE
+    # solely because the label was never detected in a "reliable" frame window.
+    if h == "Pending" or v == "Pending":
+        fallback_box = track.get("best_complete_box")
+        fallback_label = track.get("best_complete_label_box")
+        if fallback_box is not None and fallback_label is not None:
+            bx_c = (fallback_box[0] + fallback_box[2]) / 2.0
+            by_c = (fallback_box[1] + fallback_box[3]) / 2.0
+            lx_c = (fallback_label[0] + fallback_label[2]) / 2.0
+            ly_c = (fallback_label[1] + fallback_label[3]) / 2.0
+            bw_c = max(1.0, float(fallback_box[2] - fallback_box[0]))
+            bh_c = max(1.0, float(fallback_box[3] - fallback_box[1]))
+            h_off_c = (lx_c - bx_c) / bw_c
+            v_off_c = (ly_c - by_c) / bh_c
+            if h == "Pending":
+                h = "PASS" if abs(h_off_c) <= H_CENTRICITY_THRESH else "FAIL"
+                track["final_h_value"] = abs(h_off_c)
+                print(
+                    f"Bottle #{track['id'] + 1} H fallback → "
+                    f"{h_off_c:.3f} ({h})"
+                )
+            if v == "Pending":
+                v = "PASS" if abs(v_off_c - EXPECTED_V) <= V_DEVIATION_THRESH else "FAIL"
+                track["final_v_value"] = abs(v_off_c)
+                print(
+                    f"Bottle #{track['id'] + 1} V fallback → "
+                    f"{v_off_c:.3f} ({v})"
+                )
+
+    track["h_center"] = h
+    track["v_center"] = v
+
+    orientation = majority_result(
+        track.get("orientation_history", [])
+    )
+    # Freeze representative numeric measurements independently from the
+    # categorical PASS/FAIL majority result.
+    # Preserve fallback values set above; only overwrite if history data exists.
+    h_numeric = stable_numeric([abs(v) for v in track.get("h_value_history", [])])
+    v_numeric = stable_numeric([abs(v) for v in track.get("v_value_history", [])])
+    if h_numeric is not None:
+        track["final_h_value"] = h_numeric
+    if v_numeric is not None:
+        track["final_v_value"] = v_numeric
+    track["final_orientation_angle"] = stable_numeric(
+        track.get("orientation_angle_history", [])
+    )
 
     # If a measurement was never available, keep it as Pending/N/A rather
     # than silently converting missing data into FAIL.
@@ -660,6 +859,12 @@ def finalize_measurements(track):
         track["v_center"] = "Pending"
     if track["orientation"] is None:
         track["orientation"] = "Pending"
+
+    # If capacity was never read by OCR, fall back to the expected capacity
+    # passed via --expected-capacity. All bottles in a single run are the
+    # same type, so this is always correct for the current run.
+    if track.get("capacity") is None:
+        track["capacity"] = EXPECTED_CAPACITY
 
     track["finalized"] = True
 
@@ -690,18 +895,22 @@ def analyze_bottle(frame, bottle_box, capacity_boxes, label_boxes, damage_boxes,
         "v_center": None,
     }
 
+    _cap_tol = 15
     for cap_box in capacity_boxes:
-        if cap_box[0] >= bottle_box[0] and cap_box[2] <= bottle_box[2]:
+        if (
+            cap_box[0] >= bottle_box[0] - _cap_tol
+            and cap_box[2] <= bottle_box[2] + _cap_tol
+            and cap_box[1] >= bottle_box[1] - _cap_tol
+            and cap_box[3] <= bottle_box[3] + _cap_tol
+        ):
             cap = run_ocr(frame, cap_box)
             if cap:
                 result["capacity"] = cap
                 break
 
-    clipped_label_box = get_matching_label_box(bottle_box, label_boxes)
-    if clipped_label_box is not None:
-        h, v = check_centricity(bottle_box, clipped_label_box)
-        result["h_center"] = h
-        result["v_center"] = v
+    # H/V centricity is intentionally not calculated here.
+    # It is calculated through update_centricity() so the live path uses
+    # the same mask-based centroids and expected-V logic for every bottle type.
 
     # Defects are evaluated only after the bottle segmentation
     # mask is available.
@@ -805,9 +1014,34 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
         f"Bottle #{track['id'] + 1}",
         f"Status: {status}",
         f"Capacity: {track['capacity']} ml" if track["capacity"] else "Capacity: N/A",
-        f"Orientation: {track['orientation'] or 'N/A'}",
-        f"H Center: {track['h_center'] or 'Pending'}",
-        f"V Center: {track['v_center'] or 'Pending'}",
+        "Orientation: "
+        + (
+            format_measurement(
+                track.get("final_orientation_angle"),
+                track.get("orientation"),
+                " deg",
+            )
+            if track.get("final_orientation_angle") is not None
+            else (track.get("orientation") or "N/A")
+        ),
+        "H Center: "
+        + (
+            format_measurement(
+                track.get("final_h_value"),
+                track.get("h_center"),
+            )
+            if track.get("final_h_value") is not None
+            else (track.get("h_center") or "Pending")
+        ),
+        "V Center: "
+        + (
+            format_measurement(
+                track.get("final_v_value"),
+                track.get("v_center"),
+            )
+            if track.get("final_v_value") is not None
+            else (track.get("v_center") or "Pending")
+        ),
         f"Defects: {', '.join(track['defects']) if track['defects'] else 'None'}",
         "Blue = orientation axes",
         "Orange = centricity",
@@ -1032,9 +1266,35 @@ def save_bottle_images(frame, track):
 
     print("=" * 40)
     print(f"Bottle #{track['id'] + 1} FINAL RESULT")
-    print(f"Orientation : {track['orientation'] or 'N/A'}")
-    print(f"H Center    : {track['h_center']}")
-    print(f"V Center    : {track['v_center']}")
+    orientation_text = (
+        format_measurement(
+            track.get("final_orientation_angle"),
+            track.get("orientation"),
+            " deg",
+        )
+        if track.get("final_orientation_angle") is not None
+        else (track.get("orientation") or "N/A")
+    )
+    h_center_text = (
+        format_measurement(
+            track.get("final_h_value"),
+            track.get("h_center"),
+        )
+        if track.get("final_h_value") is not None
+        else (track.get("h_center") or "Pending")
+    )
+    v_center_text = (
+        format_measurement(
+            track.get("final_v_value"),
+            track.get("v_center"),
+        )
+        if track.get("final_v_value") is not None
+        else (track.get("v_center") or "Pending")
+    )
+
+    print(f"Orientation : {orientation_text}")
+    print(f"H Center    : {h_center_text}")
+    print(f"V Center    : {v_center_text}")
     print(f"Defects     : {', '.join(track['defects']) if track['defects'] else 'None'}")
     print(f"Status      : {final_status}")
     print("=" * 40)
@@ -1140,73 +1400,63 @@ def get_matching_label_box(bottle_box, label_boxes):
     candidates.sort(key=lambda item: (item[0], item[1]))
     return candidates[0][2]
 
-
-def update_centricity(track, bottle_box, label_boxes):
-    """
-    Update H/V centricity using the best spatially matched label.
-
-    The bottle is moving through the camera, so its normalized
-    label-to-bottle offset can change gradually from frame to frame.
-    We therefore do not compare every measurement against a rolling
-    median. A measurement is rejected only when it makes a sudden,
-    unusually large jump from the previous accepted measurement.
-    """
+def update_centricity(track, bottle_box, label_boxes, seg_detections=None, bottle_mask=None, frame=None):
     clipped_label_box = get_matching_label_box(bottle_box, label_boxes)
-
     if clipped_label_box is None:
         return False
 
-    bx, by = box_center(bottle_box)
-    lx, ly = box_center(clipped_label_box)
+    label_mask = (
+        find_label_mask(bottle_box, seg_detections, frame)
+        if seg_detections is not None and frame is not None
+        else None
+    )
 
-    bw = max(1.0, float(bottle_box[2] - bottle_box[0]))
-    bh = max(1.0, float(bottle_box[3] - bottle_box[1]))
-
-    h_offset = (lx - bx) / bw
-    v_offset = (ly - by) / bh
+    (
+        _h_status,
+        _v_status,
+        h_offset,
+        v_offset,
+        (bx, by),
+        (lx, ly),
+    ) = check_centricity(
+        bottle_box,
+        clipped_label_box,
+        bottle_mask=bottle_mask,
+        label_mask=label_mask,
+    )
 
     history = track.get("centricity_offset_history", [])
-
-    # Give the first few valid measurements a short warm-up period.
-    # Early frames can contain a partially visible bottle or unstable
-    # bounding-box/label geometry, so do not let the very first measurement
-    # permanently become the reference for the whole track.
-    #
-    # After the warm-up, reject only a sudden jump from the immediately
-    # previous accepted measurement.
     if len(history) >= CENTRICITY_MIN_HISTORY:
         previous_h, previous_v = history[-1]
-        h_jump = abs(h_offset - previous_h)
-        v_jump = abs(v_offset - previous_v)
-
-        if (
-            h_jump > CENTRICITY_SPATIAL_TOLERANCE
-            or v_jump > CENTRICITY_SPATIAL_TOLERANCE
-        ):
-            print(
-                f"Bottle #{track['id'] + 1} centricity sudden jump ignored: "
-                f"offset=({h_offset:.3f}, {v_offset:.3f}), "
-                f"previous=({previous_h:.3f}, {previous_v:.3f})"
-            )
+        if (abs(h_offset - previous_h) > CENTRICITY_SPATIAL_TOLERANCE or
+                abs(v_offset - previous_v) > CENTRICITY_SPATIAL_TOLERANCE):
+            print(f"Bottle #{track['id'] + 1} centricity sudden jump ignored: "
+                  f"offset=({h_offset:.3f}, {v_offset:.3f}), "
+                  f"previous=({previous_h:.3f}, {previous_v:.3f})")
             return False
 
     history.append((h_offset, v_offset))
     if len(history) > CENTRICITY_HISTORY_WINDOW:
         del history[:-CENTRICITY_HISTORY_WINDOW]
-
     track["centricity_offset_history"] = history
 
-    h, v = check_centricity(bottle_box, clipped_label_box)
+    h = "PASS" if abs(h_offset) <= H_CENTRICITY_THRESH else "FAIL"
+
+    v = (
+        "PASS"
+        if abs(v_offset - EXPECTED_V) <= V_DEVIATION_THRESH
+        else "FAIL"
+    )
     track["h_center"] = h
     track["v_center"] = v
 
-    print(
-        f"Bottle #{track['id'] + 1} centricity updated: "
-        f"H={h}, V={v}, "
-        f"offset=({h_offset:.3f}, {v_offset:.3f})"
-    )
-    return True
+    print(f"Bottle #{track['id'] + 1} mask centricity updated: H={h}, V={v}, "
+          f"mask_offset=({h_offset:.3f}, {v_offset:.3f}), "
+          f"bottle_centroid=({bx:.1f}, {by:.1f}), "
+          f"label_centroid=({lx:.1f}, {ly:.1f})"
+        )
 
+    return True
 
 def defect_on_bottle(defect_box, bottle_mask):
     """
@@ -1235,6 +1485,7 @@ def defect_on_bottle(defect_box, bottle_mask):
 
     return overlap_ratio >= DEFECT_OVERLAP_THRESH
 
+
 def update_defects(
     track,
     bottle_box,
@@ -1255,8 +1506,10 @@ def update_defects(
 
     defects = set(track["defects"])
 
-    current_mask = track.get("_current_bottle_mask")
+    current_mask = bottle_mask
 
+    if current_mask is None:
+        current_mask = track.get("_current_bottle_mask")
     # ---------------------------------------------------------
     # Check whether each defect type is valid in this frame
     # ---------------------------------------------------------
@@ -1271,17 +1524,41 @@ def update_defects(
     )
 
     # ---------------------------------------------------------
-    # Update consecutive detection streaks
+    # Update defect confirmation streaks
+    # Allow a short detector miss without immediately resetting
+    # the confirmation streak.
     # ---------------------------------------------------------
+
+    # DAMAGE
     if damage_valid:
         track["defect_streaks"]["damage"] += 1
+        track["defect_missing_frames"]["damage"] = 0
     else:
-        track["defect_streaks"]["damage"] = 0
+        if track["defect_streaks"]["damage"] > 0:
+            track["defect_missing_frames"]["damage"] += 1
 
+            if (
+                track["defect_missing_frames"]["damage"]
+                > DEFECT_MAX_MISSING_FRAMES
+            ):
+                track["defect_streaks"]["damage"] = 0
+                track["defect_missing_frames"]["damage"] = 0
+
+
+    # BUMP
     if bump_valid:
         track["defect_streaks"]["bump"] += 1
+        track["defect_missing_frames"]["bump"] = 0
     else:
-        track["defect_streaks"]["bump"] = 0
+        if track["defect_streaks"]["bump"] > 0:
+            track["defect_missing_frames"]["bump"] += 1
+
+            if (
+                track["defect_missing_frames"]["bump"]
+                > DEFECT_MAX_MISSING_FRAMES
+            ):
+                track["defect_streaks"]["bump"] = 0
+                track["defect_missing_frames"]["bump"] = 0
 
     # ---------------------------------------------------------
     # Accept defect only after confirmation
@@ -1433,7 +1710,7 @@ def update_best_complete_detection(
     frame_h, frame_w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, box)
 
-    if not (x1 > 0 and y1 > 0 and x2 < frame_w and y2 < frame_h):
+    if not is_reliable_bottle_frame(box, frame.shape):
         return
 
     current_area = max(0, x2 - x1) * max(0, y2 - y1)
@@ -1489,25 +1766,49 @@ def update_best_complete_detection(
     else:
         track["best_complete_orientation_data"] = None
 
-def update_best_valid_detection(track, box, frame, label_box=None, damage_boxes=None, bump_boxes=None, force=False):
+def update_best_valid_detection(
+    track,
+    box,
+    frame,
+    label_box=None,
+    damage_boxes=None,
+    bump_boxes=None,
+    force=False,
+    seg_detections=None,
+    bottle_mask=None,
+):
     if label_box is None:
         return
 
     frame_h, frame_w = frame.shape[:2]
     x1, y1, x2, y2 = map(int, box)
 
-    if not (x1 > 0 and y1 > 0 and x2 < frame_w and y2 < frame_h):
+    if not is_reliable_bottle_frame(box, frame.shape):
         return
 
-    h, v = check_centricity(box, label_box)
+    label_mask = (
+        find_label_mask(box, seg_detections, frame)
+        if seg_detections is not None
+        else None
+    )
 
-    bx, by = box_center(box)
-    lx, ly = box_center(label_box)
-    bw = max(1.0, float(x2 - x1))
-    bh = max(1.0, float(y2 - y1))
+    (
+        h,
+        v,
+        h_offset,
+        v_offset,
+        _bottle_center,
+        _label_center,
+    ) = check_centricity(
+        box,
+        label_box,
+        bottle_mask=bottle_mask,
+        label_mask=label_mask,
+    )
 
-    h_error = abs(lx - bx) / bw
-    v_error = abs(ly - by) / bh
+    h_error = abs(h_offset)
+    v_error = abs(v_offset - EXPECTED_V)
+
     centricity_error = h_error + v_error
 
     current_area = max(0, x2 - x1) * max(0, y2 - y1)
@@ -1725,10 +2026,10 @@ try:
                 else:
                     continue
 
-        detections = model.predict(frame, threshold=THRESHOLD)
+        detections = model.predict(frame, threshold=min(PER_CLASS_CONF.values()))
 
-        # Segmentation is used ONLY to obtain bottle masks for orientation.
-        seg_detections = seg_model.predict(frame, threshold=SEG_THRESHOLD)
+        # Segmentation is used to obtain bottle/label masks for orientation and centricity.
+        seg_detections = seg_model.predict(frame, threshold=min(PER_CLASS_CONF.values()))
 
         bottle_boxes = []
         capacity_boxes = []
@@ -1739,8 +2040,10 @@ try:
         display = frame.copy()
 
         for i, cls in enumerate(detections.data["class_name"]):
+            if float(detections.confidence[i]) < PER_CLASS_CONF.get(cls, THRESHOLD):
+                continue
             x1, y1, x2, y2 = map(int, detections.xyxy[i])
-
+            print(f"  [BOTTLE DETECT] cls={cls} conf={float(detections.confidence[i]):.3f}")
             if cls == "bottle":
                 bottle_boxes.append((x1, y1, x2, y2))
             elif cls == "capacity":
@@ -1786,22 +2089,6 @@ try:
                         # Store the latest valid mask.
                         track["_current_bottle_mask"] = bottle_mask
 
-                        print(f"DEBUG - Frame shape: {frame.shape}")
-                        print(f"DEBUG - Mask shape: {bottle_mask.shape}")
-
-                        ys, xs = np.where(bottle_mask > 0)
-
-                        if len(xs) > 0:
-                            mask_box = (
-                                int(xs.min()),
-                                int(ys.min()),
-                                int(xs.max()),
-                                int(ys.max())
-                            )
-
-                            print(f"DEBUG - Bottle box: {bottle}")
-                            print(f"DEBUG - Mask bbox:   {mask_box}")
-
                         orientation_data = get_mask_orientation(bottle_mask)
 
                         if orientation_data is not None:
@@ -1814,22 +2101,73 @@ try:
                         bottle_mask = track.get("_current_bottle_mask")
                         orientation_data = track.get("orientation_data")
 
-                    update_centricity(track, bottle, label_boxes)
+                    bx1, by1, bx2, by2 = bottle
+                    fh, fw = frame.shape[:2]
+                    centricity_updated = False
 
-                    # Accumulate measurements over the bottle's lifetime.
-                    # Final H/V/orientation are decided from these samples,
-                    # not from one unstable frame.
-                    if track["h_center"] in {"PASS", "FAIL"}:
-                        track["h_history"].append(track["h_center"])
-                    if track["v_center"] in {"PASS", "FAIL"}:
-                        track["v_history"].append(track["v_center"])
+                    centricity_updated = update_centricity(
+                        track,
+                        bottle,
+                        label_boxes,
+                        seg_detections=seg_detections,
+                        bottle_mask=bottle_mask,
+                        frame=frame,
+                    )
+
+                    if centricity_updated:
+                        if track["h_center"] in {"PASS", "FAIL"}:
+                            track["h_history"].append(track["h_center"])
+
+                        if track["v_center"] in {"PASS", "FAIL"}:
+                            track["v_history"].append(track["v_center"])
+
                     if track["orientation"] in {"PASS", "FAIL"}:
                         track["orientation_history"].append(track["orientation"])
+                    
+                    # Keep the numeric measurements that correspond to the
+                    # accepted observations used for final reporting.
+                    if centricity_updated and track.get("centricity_offset_history"):
+                        latest_h, latest_v = track["centricity_offset_history"][-1]
+                        track["h_value_history"].append(float(latest_h))
+                        track["v_value_history"].append(float(latest_v))
+
+                    if orientation_data is not None:
+                        angle_deg = orientation_data.get("angle_deg")
+                        if angle_deg is not None:
+                            track["orientation_angle_history"].append(
+                                float(angle_deg)
+                            )
 
                     current_label_box = get_matching_label_box(bottle, label_boxes)
                     current_damage_boxes = [dmg for dmg in damage_boxes if dmg[0] >= bottle[0] and dmg[2] <= bottle[2] and dmg[1] >= bottle[1] and dmg[3] <= bottle[3]]
                     current_bump_boxes = [bump for bump in bump_boxes if bump[0] >= bottle[0] and bump[2] <= bottle[2] and bump[1] >= bottle[1] and bump[3] <= bottle[3]]
+                    # TEMPORARY DEBUG — Bottle #15 only
+                    if track["id"] + 1 == 15:
+                        print("\n========== BOTTLE #15 BUMP DEBUG ==========")
+                        print(f"Raw bump boxes: {len(bump_boxes)}")
+                        print(f"Current bump boxes: {len(current_bump_boxes)}")
+                        print(
+                            f"Bottle mask: "
+                            f"{track.get('_current_bottle_mask') is not None}"
+                        )
 
+                        for i, bump in enumerate(current_bump_boxes):
+                            valid = defect_on_bottle(
+                                bump,
+                                track.get("_current_bottle_mask")
+                            )
+                            print(
+                                f"Bump {i + 1}: "
+                                f"box={tuple(map(int, bump))}, "
+                                f"valid_on_bottle={valid}"
+                            )
+
+                        print(
+                            f"Bump streak: "
+                            f"{track['defect_streaks']['bump']}"
+                        )
+                        print("============================================")
+                    
                     previous_defects = set(track["defects"])
                     update_defects(
                         track,
@@ -1839,23 +2177,35 @@ try:
                         frame=frame,
                         label_box=current_label_box,
                         orientation_data=orientation_data,
+                        bottle_mask=bottle_mask,
                     )
                     defect_changed = set(track["defects"]) != previous_defects
 
                     update_best_complete_detection(track, bottle, frame, label_box=current_label_box, damage_boxes=current_damage_boxes, bump_boxes=current_bump_boxes, force=defect_changed, orientation_data=orientation_data)
-                    update_best_valid_detection(track, bottle, frame, label_box=current_label_box, damage_boxes=current_damage_boxes, bump_boxes=current_bump_boxes, force=defect_changed)
+                    update_best_valid_detection(
+                        track,
+                        bottle,
+                        frame,
+                        label_box=current_label_box,
+                        damage_boxes=current_damage_boxes,
+                        bump_boxes=current_bump_boxes,
+                        force=defect_changed,
+                        seg_detections=seg_detections,
+                        bottle_mask=bottle_mask,
+                    )
 
                     # Keep trying OCR while the bottle is visible.
                     # Capacity is stabilized from repeated observations rather
                     # than permanently locking on the first successful read.
                     observed_capacity = None
+                    _cap_tol = 15  # px tolerance for capacity box containment
 
                     for cap_box in capacity_boxes:
                         if (
-                            cap_box[0] >= bottle[0]
-                            and cap_box[2] <= bottle[2]
-                            and cap_box[1] >= bottle[1]
-                            and cap_box[3] <= bottle[3]
+                            cap_box[0] >= bottle[0] - _cap_tol
+                            and cap_box[2] <= bottle[2] + _cap_tol
+                            and cap_box[1] >= bottle[1] - _cap_tol
+                            and cap_box[3] <= bottle[3] + _cap_tol
                         ):
                             cap = run_ocr(frame, cap_box)
 
@@ -1883,9 +2233,33 @@ try:
                                 writer.writerow([
                                     track['id'] + 1,
                                     stable_cap,
-                                    track['orientation'],
-                                    track['h_center'] or 'Pending',
-                                    track['v_center'] or 'Pending',
+                                    (
+                                        format_measurement(
+                                            track.get("orientation_angle_history", [])[-1]
+                                            if track.get("orientation_angle_history")
+                                            else None,
+                                            track.get("orientation"),
+                                            " deg",
+                                        )
+                                        if track.get("orientation_angle_history")
+                                        else track.get("orientation", "Pending")
+                                    ),
+                                    (
+                                        format_measurement(
+                                            abs(track["centricity_offset_history"][-1][0]),
+                                            track.get("h_center"),
+                                        )
+                                        if track.get("centricity_offset_history")
+                                        else track.get("h_center", "Pending")
+                                    ),
+                                    (
+                                        format_measurement(
+                                            abs(track["centricity_offset_history"][-1][1]),
+                                            track.get("v_center"),
+                                        )
+                                        if track.get("centricity_offset_history")
+                                        else track.get("v_center", "Pending")
+                                    ),
                                     ', '.join(track['defects']) or 'None',
                                     datetime.now().strftime('%H:%M:%S')
                                 ])
@@ -1929,19 +2303,42 @@ try:
                     track["_current_bottle_mask"] = None
                     orientation_data = None
 
-                track["h_center"] = result["h_center"]
-                track["v_center"] = result["v_center"]
+                initial_label_box = get_matching_label_box(bottle, label_boxes)
+
+                centricity_updated = False
+                centricity_updated = update_centricity(
+                    track,
+                    bottle,
+                    label_boxes,
+                    seg_detections=seg_detections,
+                    bottle_mask=bottle_mask,
+                    frame=frame,
+                )
+
+                if centricity_updated:
+                    if track["h_center"] in {"PASS", "FAIL"}:
+                        track["h_history"].append(track["h_center"])
+
+                    if track["v_center"] in {"PASS", "FAIL"}:
+                        track["v_history"].append(track["v_center"])
+
+                    if centricity_updated and track.get("centricity_offset_history"):
+                        latest_h, latest_v = track["centricity_offset_history"][-1]
+                        track["h_value_history"].append(float(latest_h))
+                        track["v_value_history"].append(float(latest_v))
 
                 if track["orientation"] in {"PASS", "FAIL"}:
                     track["orientation_history"].append(track["orientation"])
-                if track["h_center"] in {"PASS", "FAIL"}:
-                    track["h_history"].append(track["h_center"])
-                if track["v_center"] in {"PASS", "FAIL"}:
-                    track["v_history"].append(track["v_center"])
+
+                if orientation_data is not None:
+                    angle_deg = orientation_data.get("angle_deg")
+                    if angle_deg is not None:
+                        track["orientation_angle_history"].append(
+                            float(angle_deg)
+                        )
+
                 if track["capacity"] is not None:
                     track["capacity_history"].append(track["capacity"])
-
-                initial_label_box = get_matching_label_box(bottle, label_boxes)
 
                 initial_damage_boxes = [
                     dmg for dmg in damage_boxes
@@ -1980,7 +2377,16 @@ try:
                     bump_boxes=initial_bump_boxes,
                     orientation_data=orientation_data
                 )
-                update_best_valid_detection(track, bottle, frame, label_box=initial_label_box, damage_boxes=initial_damage_boxes, bump_boxes=initial_bump_boxes)
+                update_best_valid_detection(
+                    track,
+                    bottle,
+                    frame,
+                    label_box=initial_label_box,
+                    damage_boxes=initial_damage_boxes,
+                    bump_boxes=initial_bump_boxes,
+                    seg_detections=seg_detections,
+                    bottle_mask=bottle_mask,
+                )
 
                 print("=" * 40)
                 print(f"Bottle #{bottle_count}")
@@ -1993,7 +2399,39 @@ try:
 
                 with open(LOG_FILE, 'a', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow([bottle_count, track['capacity'] or 'Not detected', track['orientation'], track['h_center'] or 'Pending', track['v_center'] or 'Pending', ', '.join(track['defects']) or 'None', datetime.now().strftime('%H:%M:%S')])
+                    writer.writerow([
+                        bottle_count,
+                        track['capacity'] or 'Not detected',
+                        (
+                            format_measurement(
+                                track.get("orientation_angle_history", [])[-1]
+                                if track.get("orientation_angle_history")
+                                else None,
+                                track.get("orientation"),
+                                " deg",
+                            )
+                            if track.get("orientation_angle_history")
+                            else track.get("orientation", "Pending")
+                        ),
+                        (
+                            format_measurement(
+                                abs(track["h_value_history"][-1]),
+                                track.get("h_center"),
+                            )
+                            if track.get("h_value_history")
+                            else track.get("h_center", "Pending")
+                        ),
+                        (
+                            format_measurement(
+                                abs(track["v_value_history"][-1]),
+                                track.get("v_center"),
+                            )
+                            if track.get("v_value_history")
+                            else track.get("v_center", "Pending")
+                        ),
+                        ", ".join(track["defects"]) or "None",
+                        datetime.now().strftime("%H:%M:%S"),
+                    ])
 
                 tracked.append(track)
 
@@ -2027,6 +2465,8 @@ try:
         tracked = remaining_tracks
 
         for track in tracked:
+            if track["missing"] > 0:
+                continue
             x1, y1, x2, y2 = map(int, track["box"])
 
             bottle_color = (0, 255, 0)
@@ -2041,7 +2481,7 @@ try:
             bottle_cx = int((x1 + x2) / 2)
             bottle_cy = int((y1 + y2) / 2)
 
-            if track.get("orientation_data") is not None:
+            if track.get("orientation_data") is not None and track["missing"] == 0:
                 draw_mask_contour(
                     display,
                     track["orientation_data"],
@@ -2104,12 +2544,53 @@ try:
             )
             text_y = min(display.shape[0] - 20, max(25, y1 + 25))
 
+            live_orientation_angle = (
+                track["orientation_angle_history"][-1]
+                if track.get("orientation_angle_history")
+                else None
+            )
+            live_h_value = (
+                abs(track["centricity_offset_history"][-1][0])
+                if track.get("centricity_offset_history")
+                else None
+            )
+            live_v_value = (
+                abs(track["centricity_offset_history"][-1][1])
+                if track.get("centricity_offset_history")
+                else None
+            )
+
             info_lines = [
                 f"Status: {status}",
                 f"Capacity: {track['capacity']} ml" if track["capacity"] else "Capacity: N/A",
-                f"Orientation: {track['orientation'] or 'N/A'}",
-                f"H Center: {track['h_center'] or 'Pending'}",
-                f"V Center: {track['v_center'] or 'Pending'}",
+                "Orientation: "
+                + (
+                    format_measurement(
+                        live_orientation_angle,
+                        track.get("orientation"),
+                        " deg",
+                    )
+                    if live_orientation_angle is not None
+                    else (track["orientation"] or "N/A")
+                ),
+                "H Center: "
+                + (
+                    format_measurement(
+                        live_h_value,
+                        track.get("h_center"),
+                    )
+                    if live_h_value is not None
+                    else (track["h_center"] or "Pending")
+                ),
+                "V Center: "
+                + (
+                    format_measurement(
+                        live_v_value,
+                        track.get("v_center"),
+                    )
+                    if live_v_value is not None
+                    else (track["v_center"] or "Pending")
+                ),
                 f"Defects: {', '.join(track['defects']) if track['defects'] else 'None'}",
             ]
 

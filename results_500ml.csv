@@ -1,0 +1,75 @@
+Bottle,Capacity,Orientation,H_Center,V_Center,Defects,Timestamp
+1,Not detected,,0.281 (FAIL),0.103 (FAIL),None,15:15:08
+1,500,3.253 deg (PASS),0.091 (PASS),0.012 (PASS),None,15:15:08
+2,Not detected,7.579 deg (PASS),0.070 (PASS),0.020 (PASS),None,15:15:11
+3,Not detected,2.922 deg (PASS),0.125 (PASS),0.010 (PASS),None,15:15:15
+3,500,4.558 deg (PASS),0.024 (PASS),0.006 (PASS),None,15:15:16
+4,Not detected,7.633 deg (PASS),0.073 (PASS),0.012 (PASS),None,15:15:18
+5,Not detected,,0.289 (FAIL),0.096 (FAIL),None,15:15:25
+5,500,3.333 deg (PASS),0.105 (PASS),0.013 (PASS),None,15:15:25
+4,500,4.507 deg (PASS),0.429 (FAIL),0.077 (FAIL),None,15:15:27
+6,Not detected,7.733 deg (PASS),0.057 (PASS),0.017 (PASS),None,15:15:27
+7,500,,0.215 (FAIL),0.052 (PASS),None,15:15:37
+8,Not detected,7.615 deg (PASS),0.052 (PASS),0.010 (PASS),None,15:15:39
+9,Not detected,,0.330 (FAIL),0.103 (FAIL),None,15:15:45
+9,500,3.232 deg (PASS),0.108 (PASS),0.001 (PASS),None,15:15:45
+8,500,5.549 deg (PASS),0.133 (PASS),0.022 (PASS),None,15:15:47
+10,Not detected,7.584 deg (PASS),0.057 (PASS),0.010 (PASS),None,15:15:48
+11,Not detected,2.919 deg (PASS),0.127 (PASS),0.010 (PASS),None,15:15:52
+12,Not detected,7.902 deg (PASS),0.070 (PASS),0.018 (PASS),None,15:15:55
+13,500,2.933 deg (PASS),0.127 (PASS),0.008 (PASS),None,15:16:09
+12,500,5.192 deg (PASS),0.401 (FAIL),0.075 (FAIL),None,15:16:11
+14,Not detected,7.829 deg (PASS),0.073 (PASS),0.016 (PASS),None,15:16:12
+15,500,,0.221 (FAIL),0.062 (FAIL),None,15:16:15
+16,Not detected,7.280 deg (PASS),0.076 (PASS),0.009 (PASS),None,15:16:18
+17,500,,0.178 (FAIL),0.046 (PASS),None,15:16:21
+18,Not detected,7.880 deg (PASS),0.068 (PASS),0.016 (PASS),None,15:16:24
+19,Not detected,2.649 deg (PASS),0.154 (FAIL),0.010 (PASS),None,15:16:27
+19,500,3.149 deg (PASS),0.104 (PASS),0.001 (PASS),None,15:16:28
+18,500,5.073 deg (PASS),0.394 (FAIL),0.078 (FAIL),None,15:16:29
+20,Not detected,8.023 deg (PASS),0.058 (PASS),0.009 (PASS),None,15:16:30
+21,500,,0.232 (FAIL),0.074 (FAIL),None,15:16:42
+22,Not detected,6.308 deg (PASS),0.048 (PASS),0.018 (PASS),None,15:16:45
+23,500,,0.233 (FAIL),0.083 (FAIL),None,15:16:48
+22,500,4.762 deg (PASS),0.125 (PASS),0.036 (PASS),bump,15:16:50
+24,Not detected,7.273 deg (PASS),0.075 (PASS),0.018 (PASS),None,15:16:51
+25,500,,0.225 (FAIL),0.076 (FAIL),None,15:16:53
+26,Not detected,5.898 deg (PASS),0.049 (PASS),0.013 (PASS),None,15:16:57
+27,500,,0.214 (FAIL),0.070 (FAIL),None,15:17:10
+26,500,5.083 deg (PASS),0.131 (PASS),0.036 (PASS),None,15:17:12
+28,Not detected,6.625 deg (PASS),0.056 (PASS),0.020 (PASS),None,15:17:12
+29,Not detected,2.931 deg (PASS),0.127 (PASS),0.010 (PASS),None,15:17:15
+29,500,3.259 deg (PASS),0.083 (PASS),0.011 (PASS),None,15:17:16
+28,500,5.185 deg (PASS),0.143 (PASS),0.040 (PASS),None,15:17:18
+30,Not detected,2.805 deg (PASS),0.148 (PASS),0.013 (PASS),None,15:17:22
+30,500,3.175 deg (PASS),0.099 (PASS),0.014 (PASS),None,15:17:23
+31,Not detected,7.544 deg (PASS),0.060 (PASS),0.016 (PASS),None,15:17:25
+32,Not detected,,0.322 (FAIL),0.116 (FAIL),None,15:17:28
+32,500,5.702 deg (PASS),0.009 (PASS),0.007 (PASS),None,15:17:29
+33,Not detected,7.042 deg (PASS),0.060 (PASS),0.017 (PASS),None,15:17:31
+34,500,,0.198 (FAIL),0.062 (FAIL),None,15:17:43
+35,Not detected,7.143 deg (PASS),0.088 (PASS),0.022 (PASS),None,15:17:46
+36,500,,0.204 (FAIL),0.067 (FAIL),None,15:17:49
+37,500,3.125 deg (PASS),0.123 (PASS),0.010 (PASS),None,15:17:56
+38,Not detected,7.238 deg (PASS),0.077 (PASS),0.016 (PASS),None,15:17:58
+39,500,2.481 deg (PASS),0.161 (FAIL),0.010 (PASS),None,15:18:14
+38,500,4.924 deg (PASS),0.455 (FAIL),0.085 (FAIL),None,15:18:16
+40,Not detected,,0.304 (FAIL),0.107 (FAIL),None,15:18:23
+40,500,4.741 deg (PASS),0.003 (PASS),0.010 (PASS),None,15:18:25
+41,Not detected,7.543 deg (PASS),0.058 (PASS),0.019 (PASS),None,15:18:26
+42,Not detected,,0.279 (FAIL),0.100 (FAIL),None,15:18:30
+42,500,5.862 deg (PASS),0.001 (PASS),0.007 (PASS),None,15:18:32
+43,Not detected,3.052 deg (PASS),0.115 (PASS),0.008 (PASS),None,15:18:36
+43,500,5.136 deg (PASS),0.016 (PASS),0.008 (PASS),None,15:18:37
+44,Not detected,7.287 deg (PASS),0.079 (PASS),0.018 (PASS),None,15:18:39
+45,500,,0.231 (FAIL),0.071 (FAIL),None,15:18:51
+46,Not detected,3.144 deg (PASS),0.137 (PASS),0.009 (PASS),None,15:18:58
+47,Not detected,4.482 deg (PASS),0.005 (PASS),0.008 (PASS),None,15:19:00
+48,Not detected,,0.257 (FAIL),0.102 (FAIL),None,15:19:03
+48,500,3.330 deg (PASS),0.087 (PASS),0.010 (PASS),None,15:19:03
+49,Not detected,7.611 deg (PASS),0.072 (PASS),0.020 (PASS),None,15:19:06
+50,Not detected,,,,None,15:19:36
+51,Not detected,30.460 deg (PASS),,,None,15:19:43
+52,Not detected,,,,None,15:19:49
+53,Not detected,,,,None,15:19:58
+54,Not detected,,,,None,15:20:02

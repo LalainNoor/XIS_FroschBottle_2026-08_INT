@@ -1,8 +1,16 @@
+# Core computer vision
 numpy>=1.24
 opencv-python>=4.8
+
+# OCR
 easyocr>=1.7
+
+# RF-DETR detection and segmentation
 rfdetr
+
+# GenICam / Harvester camera acquisition
 harvesters
+
+# RF-DETR / EasyOCR runtime
 torch
 torchvision
-rfdetr[train,loggers]

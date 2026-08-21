@@ -2,14 +2,14 @@
 
 ## 1. Purpose
 
-This document records the RF-DETR models used by the Frosch bottle live-inspection pipeline.
+This document records the RF-DETR models used by the Frosch bottle live-inspection pipeline and the training configuration available from the project materials.
 
 The live inference system uses two separate RF-DETR checkpoints:
 
 1. RF-DETR Medium for object detection.
 2. RF-DETR Medium instance segmentation for bottle-mask generation.
 
-The segmentation model is used during live inference to obtain the actual bottle mask and calculate bottle orientation.
+The segmentation model supplies the bottle mask used for orientation and mask-based defect validation.
 
 ## 2. Models Used by Live Inference
 
@@ -18,7 +18,7 @@ The segmentation model is used during live inference to obtain the actual bottle
 | Detection | `RFDETRMedium` | `runs/frosch_medium/checkpoint_best_regular.pth` |
 | Segmentation | `RFDETRSegMedium` | `runs/frosch_seg_medium/checkpoint_best_total.pth` |
 
-The current inference script loads both checkpoints independently.
+The current inference script loads the checkpoints independently.
 
 ## 3. Detection Model
 
@@ -30,15 +30,20 @@ model = RFDETRMedium(
 )
 ```
 
-The live detection threshold is:
+### Runtime confidence configuration
 
-```text
-0.40
-```
+The final inference pipeline uses per-class confidence thresholds:
 
-The detector provides the class-specific bounding boxes used by the inspection logic.
+| Class | Threshold |
+|---|---:|
+| `bottle` | `0.70` |
+| `label` | `0.35` |
+| `capacity` | `0.35` |
+| `bump` | `0.50` |
+| `damage` | `0.30` |
+| `scratch` | `0.30` |
 
-The classes explicitly consumed by the current live script are:
+The runtime detector classes explicitly used by the inspection logic are:
 
 - `bottle`
 - `capacity`
@@ -46,55 +51,44 @@ The classes explicitly consumed by the current live script are:
 - `damage`
 - `bump`
 
-Runtime logs reported that the detection checkpoint contains 7 classes. The current inference code only uses the five class names above.
+### Detection evaluation metrics
 
-### Detection metrics
+The final RF-DETR evaluation artifacts provide per-class precision, recall, F1, AP50, and ground-truth counts. These values are recorded below as reported by the evaluation output.
 
-The available project material does not contain a verified final detection metric table for the checkpoint used by the current live script.
+| Class | Precision | Recall | F1 | AP50 | n_gt |
+|---|---:|---:|---:|---:|---:|
+| bottle | 0.9869281013499082 | 0.9934210493637465 | 0.9901634311854178 | 0.9090909059011164 | 304 |
+| bump | 0.4487179429651546 | 0.5468749914550782 | 0.4929572443964505 | 0.41295822925576553 | 64 |
+| capacity | 0.9189189158144632 | 0.9963369926874103 | 0.9560627663495121 | 0.9072138281372374 | 273 |
+| damage | 0.360655731792529 | 0.9166666284722238 | 0.5176466413843962 | 0.845539754462985 | 24 |
+| label | 0.98688524266595 | 0.9933993366554478 | 0.9901310756960197 | 0.908783780318693 | 303 |
+| scratch | 0.3333333148148158 | 0.21428570663265334 | 0.2608690775055942 | 0.20606057535354008 | 28 |
 
-Therefore, the following should not be invented:
+The corresponding per-class plot is stored at:
 
-- mAP@0.50
-- mAP@0.50:0.95
-- precision
-- recall
-- F1
-- validation loss
-- test-set accuracy
+```text
+training_metrics/per_class_metrics.png
+```
 
-These values should be added only from the actual RF-DETR training/evaluation output.
+![Per-class metrics](training_metrics/per_class_metrics.png)
 
 ## 4. RF-DETR Segmentation Training
 
 ### Training script
 
-The segmentation training script is designed specifically for the Frosch bottle COCO-segmentation dataset.
-
-It uses:
+The segmentation training script is designed for the Frosch bottle COCO-segmentation dataset and uses:
 
 ```python
 from rfdetr import RFDETRSegMedium
-```
 
-and initializes:
-
-```python
 model = RFDETRSegMedium()
 ```
 
-The segmentation model intentionally starts from its own COCO-pretrained segmentation weights.
-
-It does **not** load the detection checkpoint:
-
-```text
-runs/frosch_medium/checkpoint_best_regular.pth
-```
-
-This is important because the detection and segmentation models use different model architectures/checkpoint structures.
+The segmentation model starts from its own segmentation weights and does not load the detection checkpoint.
 
 ### Training configuration
 
-The available training script defines these defaults:
+The available training configuration is:
 
 | Parameter | Value |
 |---|---:|
@@ -107,44 +101,58 @@ The available training script defines these defaults:
 | Dataset root | `.` by default |
 | Output directory | `runs/frosch_seg_medium` |
 
-The corresponding training call is:
-
-```python
-model.train(
-    dataset_dir=str(dataset),
-    epochs=50,
-    batch_size=4,
-    grad_accum_steps=4,
-    lr=1e-4,
-    resolution=432,
-    output_dir="runs/frosch_seg_medium",
-)
-```
-
-### Reproducible command
-
-From the repository root, the training configuration can be reproduced with:
+Reproducible training command:
 
 ```bash
-python train_frosch_segmentation.py \
-    --dataset . \
-    --output runs/frosch_seg_medium \
-    --epochs 50 \
-    --batch-size 4 \
-    --grad-accum-steps 4 \
-    --resolution 432 \
-    --lr 1e-4
+python train_frosch_segmentation.py     --dataset .     --output runs/frosch_seg_medium     --epochs 50     --batch-size 4     --grad-accum-steps 4     --resolution 432     --lr 1e-4
 ```
 
-## 5. Segmentation Checkpoint Used in Inference
+## 5. Evaluation Summary and Confusion Matrix
 
-The current live script expects:
+### Metrics summary
+
+The evaluation output contains six evaluated classes: `bottle`, `bump`, `capacity`, `damage`, `label`, and `scratch`. The per-class metrics above are the reported evaluation values; they are not runtime validation counts.
+
+The evaluation shows particularly strong precision/recall/F1 for `bottle`, `capacity`, and `label`, while `bump`, `damage`, and especially `scratch` have lower precision and/or recall. This section reports the measured values without replacing them with estimates or aggregate values that were not present in the supplied evaluation artifact.
+
+### Confusion matrix
+
+The supplied evaluation artifact also includes a confusion matrix at `IoU >= 0.50`. The matrix is reproduced in the image below; rows represent ground truth classes and columns represent predicted classes, including the `missed` column.
+
+```text
+training_metrics/confusion_matrix.png
+```
+
+![Confusion Matrix (IoU >= 0.50)](training_metrics/confusion_matrix.png)
+
+The displayed matrix includes the evaluated classes `bottle`, `bump`, `capacity`, `damage`, `label`, and `scratch`, plus `missed`. The matrix should be read together with the per-class precision/recall/AP50 values rather than used as a runtime GOOD/DEFECTIVE classification result.
+
+### Confusion matrix values
+
+The numeric values shown in the supplied confusion-matrix artifact are:
+
+| Ground truth \ Predicted | bottle | bump | capacity | damage | label | scratch | missed |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bottle | 302 | 0 | 0 | 0 | 0 | 0 | 2 |
+| bump | 3 | 68 | 4 | 10 | 3 | 2 | 29 |
+| capacity | 0 | 0 | 273 | 0 | 0 | 1 | 1 |
+| damage | 0 | 0 | 2 | 41 | 0 | 0 | 2 |
+| label | 0 | 10 | 15 | 4 | 301 | 1 | 2 |
+| scratch | 1 | 0 | 0 | 6 | 1 | 14 | 22 |
+
+These values are transcribed directly from the supplied confusion-matrix image. The evaluation artifact's `n_gt` values in the per-class metrics table are retained separately as reported by the evaluation output.
+
+---
+
+## 6. Segmentation Checkpoint Used in Inference
+
+The live script expects:
 
 ```text
 runs/frosch_seg_medium/checkpoint_best_total.pth
 ```
 
-and loads it using:
+and loads it with:
 
 ```python
 seg_model = RFDETRSegMedium(
@@ -152,65 +160,77 @@ seg_model = RFDETRSegMedium(
 )
 ```
 
-with:
+The runtime segmentation threshold is:
 
 ```text
 SEG_THRESHOLD = 0.30
 ```
 
-## 6. How the Segmentation Output Is Used
+## 7. How the Segmentation Output Is Used
 
-The segmentation model is not used to replace the detector.
+The segmentation model does not replace the detector.
 
 Instead:
 
 1. RF-DETR detection identifies the bottle bounding box.
 2. RF-DETR segmentation provides candidate bottle masks.
-3. The best segmentation mask is matched to the detector bottle box using IoU.
-4. The mask is resized to the full camera-frame resolution if necessary.
+3. The best bottle mask is matched to the detector bottle using IoU.
+4. The mask is resized to the full camera-frame resolution if required.
 5. The mask is constrained to the detector bounding box.
-6. The mask pixels are used to calculate bottle orientation.
-7. The same mask is used to validate whether damage/bump detections are actually on the bottle.
+6. Mask pixels are used to calculate bottle orientation.
+7. The same bottle mask is used to validate whether damage/bump detections are actually on the bottle.
+8. The mask contour is preserved for live and saved annotations.
 
-This separation keeps tracking/class association based on the detector while using segmentation where pixel-level geometry is required.
+This keeps tracking and class association detector-based while using segmentation for pixel-level geometry.
 
+## 8. Final Runtime Geometry Configuration
 
-### Status
+The final inference system uses:
 
-| Metric / Artifact | Status |
-|---|---|
-| Training architecture | Available |
-| Training hyperparameters | Available |
-| Output directory | Available |
-| Inference checkpoint path | Available |
-| Train/validation loss curves | Pending training artifact |
-| mAP@0.50 | Pending evaluation artifact |
-| mAP@0.50:0.95 | Pending evaluation artifact |
-| IoU | Pending evaluation artifact |
-| Precision | Pending evaluation artifact |
-| Recall | Pending evaluation artifact |
-| F1 | Pending evaluation artifact |
-| Held-out test visualizations | Pending artifact |
+| Parameter | Value |
+|---|---:|
+| Segmentation threshold | `0.30` |
+| Orientation limit | `45°` |
+| H centricity threshold | `0.15` |
+| 500 ml expected V | `0.01` |
+| 100 ml expected V | `0.12` |
+| 300 ml expected V | `0.07` |
+| V deviation | `0.05` |
+| Defect mask overlap | `0.30` |
 
-**Do not replace the Pending values with estimates.**
+Centricity stabilization:
 
-## 7. Runtime Observations
+```text
+CENTRICITY_SPATIAL_TOLERANCE = 0.08
+CENTRICITY_MIN_HISTORY = 3
+CENTRICITY_HISTORY_WINDOW = 5
+MIN_RELIABLE_CENTRICITY_MEASUREMENTS = 3
+```
+
+## 9. Runtime and Validation Notes
+
+The final live pipeline has been exercised on recorded runs for:
+
+- 500 ml bottles,
+- 300 ml bottles,
+- 100 ml bottles.
+
+These runtime counts are validation observations. They are not model-accuracy metrics.
+
+See `RESULTS.md` for the final recorded run counts.
 
 When loading the current checkpoints, RF-DETR runtime warnings have been observed concerning:
 
-- different positional encodings from DINOv2,
+- positional encoding differences,
 - patch-size differences,
 - checkpoint/model class-count configuration,
 - missing `num_queries` / `group_detr` checkpoint arguments,
 - inference optimization.
 
-These warnings should be documented as runtime/environment observations rather than interpreted as model-quality metrics.
+These warnings are runtime/environment observations and should not be interpreted as model-quality metrics.
 
-The runtime also reported that the loaded RF-DETR model was not optimized for inference and suggested FP16 inference for higher GPU throughput.
 
-## 8. Relationship to the Inspection Pipeline
-
-The training outputs support the following inspection functions:
+## 10. Relationship to the Inspection Pipeline
 
 ```text
 Detection checkpoint
@@ -227,8 +247,17 @@ Segmentation checkpoint
             |
             +--> orientation
             |
+            +--> H/V centricity
+            |
             +--> defect-on-bottle validation
             |
             +--> annotated visualization
----
+```
 
+## 11. Status
+
+The documented training configuration and inference checkpoints are in place.
+
+The final live inspection behavior has been validated across the supported 100 ml, 300 ml, and 500 ml bottle runs.
+
+Formal model metrics remain intentionally separate and should only be added when the corresponding training/evaluation artifacts are available.

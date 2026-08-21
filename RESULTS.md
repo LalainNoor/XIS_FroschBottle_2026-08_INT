@@ -2,51 +2,61 @@
 
 ## 1. Purpose
 
-This document records observed runtime behavior of the current Frosch live-inspection pipeline.
+This document records observed runtime behavior of the final Frosch live-inspection pipeline.
 
-These are **runtime inspection counts**, not formal model-accuracy metrics.
+These are **runtime inspection counts**, not formal model-accuracy metrics. Formal accuracy requires manually verified ground truth for each bottle and comparison against the system's final result.
 
-A formal accuracy report requires manually verified ground truth for every bottle and comparison against the system's final result.
+## 2. Final Validation Runs
 
-## 2. Recorded Validation Run
+Final recorded frame-folder validation was performed on **21 August 2026** for all three supported bottle capacities.
 
-A recorded inference run on 12 August 2026 reached:
+| Bottle type | Frame folder | Frames | GOOD | DEFECTIVE | INCOMPLETE | Total |
+|---|---|---:|---:|---:|---:|---:|
+| 500 ml | `Capture_2026-07-15_07h31m58s` | 2,760 | 45 | 3 | 5 | 53 |
+| 300 ml | `Capture_2026-07-15_07h50m00s` | 1,270 | 8 | 7 | 0 | 15 |
+| 100 ml | `Capture_2026-07-15_07h53m14s` | 1,292 | 14 | 6 | 0 | 20 |
 
-| Final category | Count |
-|---|---:|
-| GOOD | 44 |
-| DEFECTIVE | 4 |
-| INCOMPLETE | 3 |
-| **Total finalized** | **51** |
+These totals are the final runtime results emitted by the current inference script for the three validation runs.
 
-The runtime log shows the final count after Bottle #52 was finalized:
+### 500 ml final counts
 
 ```text
-Final counts -> Total: 51 | Good: 44 | Defective: 4 | Incomplete: 3
+Total: 53 | Good: 45 | Defective: 3 | Incomplete: 5
 ```
 
-The same run also shows that the pipeline saved original and annotated images under the corresponding result directory.
+### 300 ml final counts
+
+```text
+Total: 15 | Good: 8 | Defective: 7 | Incomplete: 0
+```
+
+### 100 ml final counts
+
+```text
+Total: 20 | Good: 14 | Defective: 6 | Incomplete: 0
+```
 
 ## 3. Interpretation
 
-The 51 bottles represent bottles finalized by the runtime pipeline during that recorded run.
+The above counts represent bottles finalized by the runtime pipeline during recorded validation runs.
 
 They should **not** be interpreted as:
 
-- 44 true positives for GOOD,
-- 4 true positives for DEFECTIVE,
-- 3 true positives for INCOMPLETE,
-- 86.3% model accuracy,
-- 7.8% defect rate,
-- or any other accuracy statistic.
+- formal classification accuracy,
+- precision,
+- recall,
+- F1,
+- mAP,
+- defect rate,
+- or ground-truth correctness.
 
-Those interpretations require a manually reviewed ground-truth result for each bottle.
+A ground-truth evaluation set is required before those metrics can be reported.
 
-## 4. Examples of Observed Final Results
+## 4. Observed Final-Result Behavior
 
 ### GOOD
 
-The runtime produced examples such as:
+A GOOD result requires:
 
 ```text
 Orientation : PASS
@@ -56,46 +66,41 @@ Defects     : None
 Status      : GOOD
 ```
 
-and saved both:
+The final 500 ml run included multiple GOOD examples with orientation values around 4–6 degrees and H/V values within the configured thresholds.
+
+### DEFECTIVE — defect detection
+
+The runtime correctly records a bottle as DEFECTIVE when a confirmed bump or damage defect is present even when orientation and centricity pass.
+
+Examples in the final logs include:
 
 ```text
-original.jpg
-annotated.jpg
-```
-
-under the `good` directory.
-
-### DEFECTIVE — Centricity Failure
-
-A recorded example showed:
-
-```text
-Orientation : PASS
-H Center    : FAIL
-V Center    : PASS
-Defects     : None
-Status      : DEFECTIVE
-```
-
-This demonstrates that a centricity failure alone can make the final result DEFECTIVE.
-
-### DEFECTIVE — Confirmed Defect
-
-A recorded example showed:
-
-```text
-Orientation : PASS
-H Center    : PASS
-V Center    : PASS
+Orientation : 5.766 deg (PASS)
+H Center    : 0.093 (PASS)
+V Center    : 0.029 (PASS)
 Defects     : bump
 Status      : DEFECTIVE
 ```
 
-This demonstrates that a confirmed bump can make an otherwise passing bottle DEFECTIVE.
+and 100 ml examples such as:
+
+```text
+Orientation : 0.212 deg (PASS)
+H Center    : 0.029 (PASS)
+V Center    : 0.120 (PASS)
+Defects     : bump
+Status      : DEFECTIVE
+```
+
+### DEFECTIVE — failed inspection measurement
+
+A bottle can also be DEFECTIVE when an inspection measurement fails, even when no defect box is confirmed.
+
+This is separate from the defect-model path.
 
 ### INCOMPLETE
 
-Recorded runs also produced:
+An INCOMPLETE result is used when required measurements remain unavailable:
 
 ```text
 Orientation : Pending
@@ -105,113 +110,110 @@ Defects     : None
 Status      : INCOMPLETE
 ```
 
-The bottle was saved under:
-
-```text
-saved_bottles/incomplete/
-```
+The final 500 ml validation produced 5 INCOMPLETE bottles. These should be reviewed separately from DEFECTIVE bottles because missing measurements are not treated as physical defects.
 
 ## 5. Runtime Frame and Mask Information
 
-The camera stream used in recorded runs produced frames of:
+The three validation runs used recorded camera frames.
+
+The logs show:
+
+- 500 ml run: 2,760 frames
+- 300 ml run: 1,270 frames
+- 100 ml run: 1,292 frames
+
+The camera frame resolution used by the final pipeline is:
 
 ```text
 2048 x 2448
 ```
 
-The segmentation mask was resized to the same frame resolution:
-
-```text
-2048 x 2448
-```
-
-The logs repeatedly confirmed matching frame/mask dimensions before orientation processing.
+The bottle segmentation mask is resized to the same frame resolution before mask-based geometry is calculated.
 
 ## 6. Trigger-Line Behavior
 
-The current script uses:
+The final script uses:
 
 ```text
 TRIGGER_LINE_X_RATIO = 0.40
+TRIGGER_LINE_TOLERANCE = 20 px
 ```
 
-For the recorded 2448-pixel-wide frames, the runtime trigger line was reported at:
+For the 2448-pixel-wide validation frames, the runtime trigger line is reported at approximately:
 
 ```text
 x = 979
 ```
 
-A bottle crossing the trigger line caused finalization without waiting for the full missing-frame fallback.
-
-This was observed in recorded runs with messages such as:
-
-```text
-Bottle #31 crossed trigger line; finalizing stable result: GOOD
-```
-
-and:
-
-```text
-Bottle #32 crossed trigger line; finalizing stable result: DEFECTIVE
-```
+Crossing the line finalizes the bottle without waiting for the full missing-frame fallback.
 
 ## 7. Defect Confirmation
 
-The current script requires a defect to remain valid for two consecutive frames before it is accepted:
-
-```text
-DEFECT_CONFIRMATION_FRAMES = 2
-```
-
-The defect also needs sufficient overlap with the actual bottle segmentation mask:
+The final script uses:
 
 ```text
 DEFECT_OVERLAP_THRESH = 0.30
+DEFECT_CONFIRMATION_FRAMES = 1
+DEFECT_MAX_MISSING_FRAMES = 1
 ```
 
-This is intended to reduce isolated one-frame false positives and detections outside the actual bottle.
+A candidate defect must overlap the actual bottle segmentation mask sufficiently before it can affect the final result.
 
-## 8. Centricity Stabilization Observations
+The final pipeline intentionally uses one-frame confirmation because some real defect detections can be intermittent.
 
-Runtime logs show the stabilization logic rejecting sudden label-position changes.
+## 8. Centricity Stabilization
 
-Examples include messages such as:
+The runtime logs show the stabilization logic rejecting sudden label-position changes with messages such as:
 
 ```text
 centricity sudden jump ignored
 ```
 
-The current implementation therefore does not blindly accept every frame's H/V measurement.
-
-The stored H/V history is used to obtain a more stable final result before the bottle is finalized.
-
-## 9. Capacity OCR Observations
-
-The runtime initially reports capacity as not detected when OCR has not yet succeeded.
-
-For example:
+The current stabilization configuration is:
 
 ```text
-Capacity : Not detected
+CENTRICITY_SPATIAL_TOLERANCE = 0.08
+CENTRICITY_MIN_HISTORY = 3
+CENTRICITY_HISTORY_WINDOW = 5
 ```
 
-Later frames can update the track:
+Final H/V values are taken from accumulated measurements rather than blindly using a single transient frame.
+
+## 9. Capacity OCR
+
+Capacity OCR supports:
 
 ```text
-Bottle #1 capacity updated: 500 ml
+100 ml
+300 ml
+500 ml
 ```
 
-This is why the live pipeline keeps the bottle active across multiple frames instead of finalizing immediately after the first detection.
+During a run, capacity may initially be unavailable:
+
+```text
+Capacity : Not detected ml
+```
+
+and become available later:
+
+```text
+Bottle #N capacity updated: 500 ml
+```
+
+The current finalization logic uses `--expected-capacity` as a fallback if OCR never produces a valid capacity for the track.
 
 ## 10. CSV Output
 
-Each run creates a timestamped CSV:
+The final script creates a capacity-specific CSV at startup:
 
 ```text
-results_YYYYMMDD_HHMMSS.csv
+results_100ml.csv
+results_300ml.csv
+results_500ml.csv
 ```
 
-with:
+Columns:
 
 ```text
 Bottle
@@ -225,117 +227,47 @@ Timestamp
 
 The CSV is intended for traceability and runtime result logging.
 
-## 11. Current Known Issues / Areas for Further Validation
+## 11. Validation Status
 
-The observed runtime behavior indicates that the system is functional, but several areas still require proper validation before claiming production-level accuracy:
+The final pipeline was exercised on all three supported bottle capacities:
 
-### 11.1 H/V centricity
+- 500 ml
+- 300 ml
+- 100 ml
 
-Some bottles can receive DEFECTIVE status from an H/V FAIL even when no physical defect is detected.
+The final implementation includes:
 
-This may be a genuine centricity failure or a label/bounding-box association issue. Ground-truth review is required to distinguish the two.
+- bottle detection,
+- bottle segmentation,
+- bottle tracking,
+- capacity OCR,
+- capacity-specific H/V centricity references,
+- mask-based orientation,
+- defect validation against the bottle mask,
+- defect confirmation,
+- final GOOD/DEFECTIVE/INCOMPLETE classification,
+- complete-bottle saving,
+- annotated output preservation,
+- CSV logging.
 
-### 11.2 Incomplete bottles
+## 12. Formal Evaluation
 
-INCOMPLETE results occur when required measurements remain unavailable.
+This document intentionally does not claim formal model accuracy metrics.
 
-These cases should be reviewed to determine whether the root cause is:
-
-- missing segmentation,
-- missing label detection,
-- short track duration,
-- partial bottle visibility,
-- or another association issue.
-
-### 11.3 Segmentation alignment
-
-The current script includes explicit mask resizing and bounding-box constraints to reduce mask/frame misalignment.
-
-The saved annotated images should still be visually reviewed to confirm that the segmentation contour follows the actual bottle boundary.
-
-### 11.4 Defect quality
-
-The defect confirmation logic reduces one-frame false positives, but it does not guarantee defect-model accuracy.
-
-Damage/bump detections should be compared with manually reviewed samples.
-
-### 11.5 Formal accuracy metrics
-
-The current results document does not claim precision, recall, F1, mAP, or classification accuracy for the live inspection pipeline.
-
-Those metrics should be calculated from a ground-truth evaluation set.
-
-## 12. Recommended Final Evaluation
-
-For a final project-level evaluation, create a manually reviewed table with at least:
+A formal project evaluation should compare, for every tested bottle:
 
 | Bottle | Ground Truth | System Result | Correct? | Capacity Correct? | Orientation Correct? | H Correct? | V Correct? | Defect Correct? |
 |---|---|---|---|---|---|---|---|---|
 
-Then calculate:
-
-- overall result accuracy,
-- GOOD precision/recall,
-- DEFECTIVE precision/recall,
-- INCOMPLETE rate,
-- defect-type precision/recall,
-- capacity recognition accuracy,
-- orientation accuracy,
-- H-centering accuracy,
-- V-centering accuracy.
+From that table, formal metrics can be calculated after manual review.
 
 ## 13. Status
 
-The live pipeline is implemented and has been exercised on recorded camera runs.
+The final live pipeline is implemented and has been validated with recorded runs for all three supported bottle types.
 
-The current documentation distinguishes:
+The results document distinguishes:
 
 - verified runtime behavior,
-- observed counts,
-- known implementation limitations,
-- and metrics that still require formal ground-truth evaluation.
-
-## New Bottle Type Validation — 13 August 2026
-
-A recorded frame-folder test was performed using:
-
-- Frame source: `Capture_2026-07-15_07h53m14s`
-- Total frames: 1,292
-- Frame resolution: 2048 × 2448
-- Bottle type: 100 ml new bottle type
-
-### Final runtime results
-
-| Final category | Count |
-|---|---:|
-| GOOD | 10 |
-| DEFECTIVE | 4 |
-| INCOMPLETE | 0 |
-| **Total** | **14** |
-
-These are runtime inspection counts and are not formal accuracy metrics.
-
-### Validated behavior
-
-The new bottle type was validated for:
-
-- bottle detection
-- bottle segmentation and mask alignment
-- bottle tracking
-- orientation
-- H centricity stabilization
-- V centricity for the new bottle geometry
-- defect confirmation
-- complete-bottle saving
-- defect annotation preservation
-- 100 ml capacity reporting
-
-The new bottle type required a separate V-centricity tolerance because its normal label position produced a larger normalized vertical offset than the original bottle type.
-
-The final saved annotations were visually reviewed for representative GOOD and DEFECTIVE bottles.
-
-### Capacity
-
-The new bottle type is a 100 ml product. Capacity OCR was observed to produce ambiguous readings on some frames, so the configured expected capacity for this bottle type is used to prevent transient OCR misclassification.
-
-
+- observed validation counts,
+- implementation behavior,
+- and formal metrics that require a separate ground-truth evaluation.

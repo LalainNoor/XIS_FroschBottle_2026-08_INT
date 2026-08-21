@@ -1,638 +1,529 @@
-# Frosch Bottle Inspection Pipeline
+# Frosch Bottle Inspection — Live Inference
 
-Computer vision pipeline for automated Frosch bottle inspection using RF-DETR detection and segmentation, mask-based orientation analysis, label centricity checks, defect detection, OCR-based capacity recognition, bottle tracking, and automated result saving.
+## Overview
 
----
+This repository contains the live computer-vision inference pipeline for Frosch bottle inspection.
 
-## Project Overview
+The current pipeline combines:
 
-The pipeline processes bottle images from either:
-
-1. A live GenICam-compatible camera / camera simulator
-2. A recorded folder of image frames
-
-Both modes use the same inference and inspection pipeline.
-
-The system performs:
-
-- Bottle detection
-- Bottle segmentation
-- Bottle tracking
-- Bottle mask alignment
-- Mask-based orientation estimation
-- Label detection and association
-- Horizontal and vertical label centricity checks
-- Damage detection
-- Bump detection
-- Multi-frame defect confirmation
-- Capacity OCR
-- Bottle finalization
-- GOOD / DEFECTIVE / INCOMPLETE classification
-- Annotated bottle image saving
-- Original bottle image saving
+- RF-DETR Medium object detection
+- RF-DETR Medium instance segmentation
+- EasyOCR for bottle-capacity reading
+- Bottle tracking across camera frames
+- Bottle-mask-based orientation estimation
+- Mask-based horizontal and vertical centricity checks
+- Damage and bump detection
+- Per-class detector confidence thresholds
+- Defect confirmation across frames
+- GOOD / DEFECTIVE / INCOMPLETE final classification
+- Capacity-specific H/V centricity references for 100 ml, 300 ml, and 500 ml bottles
+- Complete-bottle image saving
 - CSV result logging
-- Live visualization
+- Live annotated display through OpenCV
+- GenICam camera acquisition through Harvester
 
----
+The current implementation supports both live camera input and recorded frame-folder testing.
 
-## Repository Structure
+## Current Pipeline
 
-    .
-    ├── live_inference.py
-    ├── README.md
-    ├── RESULTS.md
-    ├── FROSCH_TRAINING_REPORT.md
-    ├── FROSCH_BOTTLE_IMAGE_SAVING.md
-    ├── requirements.txt
-    ├── .gitignore
-    ├── runs/
-    │   ├── frosch_medium/
-    │   └── frosch_seg_medium/
-    └── saved_bottles/
-        ├── good/
-        ├── defective/
-        └── incomplete/
-
-Generated result CSV files and other runtime outputs may also be created during inference.
-
----
+```text
+GenICam / VimbaX camera or recorded frame folder
+                    |
+                    v
+              Frame acquisition
+                    |
+          +---------+---------+
+          |                   |
+          v                   v
+ RF-DETR Medium detection   RF-DETR Seg Medium
+          |                   |
+          |                   +--> bottle mask
+          |                         |
+          |                         +--> orientation
+          |
+          +--> bottle
+          +--> capacity ------> EasyOCR
+          +--> label ---------> H/V centricity
+          +--> damage --------> defect validation
+          +--> bump ----------> defect validation
+          |
+          v
+       Tracking
+          |
+          +--> temporal H/V/orientation history
+          +--> defect confirmation
+          +--> trigger-line / missing-frame finalization
+          |
+          v
+   Final classification
+   GOOD / DEFECTIVE / INCOMPLETE
+          |
+          +--> CSV result log
+          |
+          +--> saved_bottles/
+                +--> 100ml/
+                |    +--> good/
+                |    +--> defective/
+                |    +--> incomplete/
+                +--> 300ml/
+                |    +--> good/
+                |    +--> defective/
+                |    +--> incomplete/
+                +--> 500ml/
+                     +--> good/
+                     +--> defective/
+                     +--> incomplete/
+```
 
 ## Models
 
-The pipeline uses two RF-DETR models.
+### Detection model
 
-### Bottle Detection
+The live script loads:
 
-    runs/frosch_medium/checkpoint_best_regular.pth
+```text
+runs/frosch_medium/checkpoint_best_regular.pth
+```
 
-### Bottle Segmentation
+The model is instantiated as:
 
-    runs/frosch_seg_medium/checkpoint_best_total.pth
+```python
+RFDETRMedium(pretrain_weights=CHECKPOINT)
+```
 
-The segmentation model provides the bottle mask used for:
+The live pipeline uses per-class confidence thresholds instead of relying on one universal threshold:
 
-- Bottle-mask alignment
-- Bottle orientation
-- Defect-overlap validation
-- Saved annotation visualization
+| Class | Confidence |
+|---|---:|
+| `bottle` | `0.70` |
+| `label` | `0.35` |
+| `capacity` | `0.35` |
+| `bump` | `0.50` |
+| `damage` | `0.30` |
+| `scratch` | `0.30` |
 
----
+The current live inspection logic explicitly consumes the bottle, label, capacity, damage, and bump classes.
 
-## Requirements
+### Segmentation model
 
-Install the dependencies using:
+The live script loads:
 
-    pip install -r requirements.txt
+```text
+runs/frosch_seg_medium/checkpoint_best_total.pth
+```
 
-For GPU-based execution, make sure the appropriate CUDA-enabled PyTorch environment is available.
+The model is instantiated as:
 
----
+```python
+RFDETRSegMedium(pretrain_weights=SEG_CHECKPOINT)
+```
 
-## Running Inference
+The runtime segmentation threshold is:
 
-The project uses a single `live_inference.py` script for both live camera inference and recorded-frame testing.
+```text
+SEG_THRESHOLD = 0.30
+```
 
-No separate `live_inference_frames.py` script is required.
+The best bottle segmentation mask is matched to the detector bottle using IoU, resized to the frame resolution when needed, and constrained to the detector box before mask-based geometry is calculated.
 
-### Live Camera / Simulator
+## Capacity OCR
 
-Run the default live inference mode:
+EasyOCR is initialized with GPU execution:
 
-    python live_inference.py
+```python
+reader = easyocr.Reader(['en'], gpu=True)
+```
 
-The default input mode is:
+The detected capacity region is padded, converted to grayscale, enlarged 5×, enhanced with CLAHE, and evaluated with multiple preprocessing variants including Otsu and adaptive thresholding.
 
-    camera
+OCR results are restricted to:
 
-The input mode can also be specified explicitly:
+- `100 ml`
+- `300 ml`
+- `500 ml`
 
-    python live_inference.py --input camera
+OCR candidates below confidence `0.15` are ignored.
 
-The camera source is configured through the GenICam/Harvester setup in `live_inference.py`.
+The final run also supports an expected bottle capacity supplied through `--expected-capacity`. If OCR never produces a valid capacity, the finalization logic falls back to that configured expected capacity for the current run.
 
-The live window can be closed by pressing:
+## Bottle Tracking
 
-    q
+Bottle tracks use:
 
----
+- IoU matching with threshold `0.40`
+- conservative center-distance fallback for normal horizontal motion
+- up to `20` missing frames before fallback finalization
 
-### Recorded Frame Testing
+Each track maintains capacity history, orientation history, H/V centricity history, segmentation state, defect state, selected complete frames, selected defect frames, and final status.
 
-Recorded frames can be processed directly using the same script:
+## Orientation Check
 
-    python live_inference.py \
-        --input folder \
-        --frame-dir /path/to/frame/folder \
-        --expected-capacity 100
+Orientation is calculated from actual bottle-mask pixels rather than only from the detector bounding box.
 
-For the currently validated 100 ml bottle type:
+The mask pixels are analyzed using covariance/eigenvector geometry to obtain the bottle's principal axis.
 
-    python live_inference.py \
-        --input folder \
-        --frame-dir /home/xisai/Downloads/Capture_2026-07-15_07h53m14s \
-        --expected-capacity 100
+```text
+ORIENTATION_MAX_ANGLE_DEG = 45.0
+```
 
-The folder mode is intended for:
+Therefore:
 
-- Repeatable testing
-- New bottle-type validation
-- Regression testing
-- Testing previously captured image sequences
+```text
+angle <= 45°  -> PASS
+angle > 45°   -> FAIL
+```
 
-The source folder is scanned for supported image formats including:
+## H/V Centricity
 
-    .jpg
-    .jpeg
-    .png
-    .bmp
-    .tif
-    .tiff
+Bottle and label centroids are primarily obtained from segmentation masks. Bounding-box centers are used only as fallback when the corresponding mask is unavailable.
 
-Frames are processed in natural filename order.
+The normalized offsets are:
 
----
+```text
+H offset = (label_center_x - bottle_center_x) / bottle_width
+V offset = (label_center_y - bottle_center_y) / bottle_height
+```
 
-## Runtime Arguments
+### H centricity
 
-| Argument | Options / Example | Description |
-|---|---|---|
-| `--input` | `camera` / `folder` | Selects the inference input source. Default: `camera` |
-| `--frame-dir` | `/path/to/frames` | Folder containing recorded frames when `--input folder` is selected |
-| `--expected-capacity` | `100`, `300`, `500` | Expected bottle capacity for the bottle type being tested |
+```text
+H_CENTRICITY_THRESH = 0.15
+```
 
-Example:
+### Capacity-specific V centricity
 
-    python live_inference.py \
-        --input folder \
-        --frame-dir /home/xisai/Downloads/Capture_2026-07-15_07h53m14s \
-        --expected-capacity 100
+The expected normalized V position depends on bottle capacity:
 
-The same inspection pipeline is used regardless of the selected input mode.
+| Capacity | Expected V |
+|---|---:|
+| 500 ml | `0.01` |
+| 100 ml | `0.12` |
+| 300 ml | `0.07` |
 
----
+The allowed deviation is:
 
-## Input Processing Pipeline
+```text
+V_DEVIATION_THRESH = 0.05
+```
 
-    Input
-      │
-      ├── Camera
-      │     └── GenICam / Harvester
-      │
-      └── Folder
-            └── Recorded image frames
-                  │
-                  ▼
-           RF-DETR Bottle Detection
-                  │
-                  ▼
-           RF-DETR Bottle Segmentation
-                  │
-                  ▼
-            Bottle Mask Alignment
-                  │
-                  ▼
-              Bottle Tracking
-                  │
-                  ├── Orientation
-                  ├── Label Association
-                  ├── H Centricity
-                  ├── V Centricity
-                  ├── Capacity OCR
-                  └── Defect Detection
-                           │
-                           ▼
-                    Multi-frame Confirmation
-                           │
-                           ▼
-                      Final Bottle State
-                           │
-                 ┌─────────┼─────────┐
-                 ▼         ▼         ▼
-               GOOD     DEFECTIVE  INCOMPLETE
-                 │         │         │
-                 └─────────┼─────────┘
-                           ▼
-                      Save Results
+### Centricity stabilization
 
----
+The pipeline stabilizes measurements across multiple observations:
 
-## Bottle Segmentation and Mask Alignment
+```text
+CENTRICITY_SPATIAL_TOLERANCE = 0.08
+CENTRICITY_MIN_HISTORY = 3
+CENTRICITY_HISTORY_WINDOW = 5
+MIN_RELIABLE_CENTRICITY_MEASUREMENTS = 3
+```
 
-The segmentation model provides the bottle mask.
+Sudden spatial jumps are ignored rather than immediately replacing an established measurement.
 
-The mask is:
+## Defect Validation
 
-1. Resized to the current frame resolution when necessary.
-2. Constrained to the detected bottle bounding box.
-3. Used as the geometry source for orientation.
-4. Used to validate whether detected defects overlap the actual bottle region.
+Damage and bump detections are validated against the actual bottle segmentation mask.
 
-This prevents segmentation padding or coordinate differences from producing mask regions outside the detected bottle.
+A defect must overlap the bottle mask by at least:
 
----
+```text
+DEFECT_OVERLAP_THRESH = 0.30
+```
 
-## Orientation Detection
+The current final pipeline accepts a defect after:
 
-Bottle orientation is calculated from the segmentation mask pixels.
+```text
+DEFECT_CONFIRMATION_FRAMES = 1
+```
 
-The system derives the bottle's principal axis using the mask geometry and determines the orientation angle.
+valid detection, with:
 
-The orientation status is:
+```text
+DEFECT_MAX_MISSING_FRAMES = 1
+```
 
-    PASS
-    FAIL
-
-The configured orientation limit is:
-
-    45 degrees
-
-The saved annotations can display the bottle's orientation axes.
-
----
-
-## Label Detection and Centricity
-
-The pipeline associates the most spatially consistent label box with the detected bottle.
-
-The label is clipped to the bottle boundary before centricity is evaluated.
-
-Two centricity measurements are calculated.
-
-### H Center
-
-Horizontal label-to-bottle center offset.
-
-Default threshold:
-
-    0.15
-
-### V Center
-
-Vertical label-to-bottle center offset.
-
-Default threshold:
-
-    0.15
-
-For the currently validated narrow/tall new bottle type, a larger V tolerance is used:
-
-    0.20
-
-The new bottle type also uses an aspect-ratio rule to distinguish it from the original bottle geometry.
-
----
-
-## Centricity Stabilization
-
-Centricity is accumulated over the bottle's lifetime rather than relying on a single frame.
-
-The pipeline:
-
-- Keeps a short history of accepted normalized label offsets.
-- Rejects sudden spatial jumps.
-- Uses accumulated H/V results for final bottle classification.
-- Prevents temporary edge-of-frame failures from unnecessarily determining the final result.
-
-This is particularly important when the bottle is entering or leaving the camera view.
-
----
-
-## Defect Detection
-
-The pipeline detects:
-
-- Damage
-- Bump
-
-A detected defect is only accepted when it sufficiently overlaps the actual bottle segmentation mask.
-
-Configured defect overlap threshold:
-
-    0.30
-
-A defect must also be detected in consecutive frames before it is accepted.
-
-Current confirmation requirement:
-
-    2 consecutive frames
-
-This reduces isolated one-frame false positives.
-
----
-
-## Capacity Detection
-
-Capacity is initially estimated using OCR.
-
-The OCR process uses multiple preprocessing variants, including:
-
-- Original grayscale
-- CLAHE-enhanced grayscale
-- Otsu thresholding
-- Adaptive thresholding
-
-The accepted capacities are:
-
-    100 ml
-    300 ml
-    500 ml
-
-For a known bottle type, the expected capacity can be provided explicitly:
-
-    --expected-capacity 100
-
-For example:
-
-    python live_inference.py \
-        --input folder \
-        --frame-dir /path/to/frames \
-        --expected-capacity 100
-
-This allows the OCR process to be used for recognition while preventing transient OCR errors from changing the final product capacity.
-
-When testing another bottle type, set `--expected-capacity` to the correct product capacity.
-
----
-
-## Bottle Tracking and Finalization
-
-Each detected bottle receives a track ID.
-
-Bottle matching uses:
-
-- Bounding-box IoU
-- Conservative center-distance fallback
-
-The fallback is intended for normal bottle motion between frames.
-
-A bottle is finalized after it has disappeared from the stream for the configured number of missing frames or when the processing sequence ends.
-
-The current missing-frame threshold is:
-
-    20 frames
-
-A bottle must have a valid complete saved frame before it can be finalized and saved.
-
----
+This preserves short-lived real detections while rejecting detections that do not overlap the actual bottle mask.
 
 ## Final Classification
-
-The system produces one of three final states.
 
 ### GOOD
 
 A bottle is GOOD when:
 
-- Orientation passes
-- H centricity passes
-- V centricity passes
-- No confirmed defects are present
-- Required measurements are available
+- orientation is PASS,
+- H centricity is PASS,
+- V centricity is PASS,
+- no confirmed defects exist.
 
 ### DEFECTIVE
 
 A bottle is DEFECTIVE when:
 
-- A confirmed damage defect is present
-- A confirmed bump defect is present
-- Orientation fails
-- H centricity fails
-- V centricity fails
+- orientation is FAIL, or
+- H centricity is FAIL, or
+- V centricity is FAIL, or
+- a confirmed damage defect exists, or
+- a confirmed bump defect exists.
 
 ### INCOMPLETE
 
-A bottle is INCOMPLETE when required measurements remain unavailable.
+A bottle is INCOMPLETE when one or more required measurements remain `Pending`.
 
-Missing measurements are not automatically converted into DEFECTIVE.
+Missing measurements are kept distinct from actual FAIL conditions.
 
----
+## Bottle Finalization
+
+The script supports two finalization paths.
+
+### Trigger-line finalization
+
+```text
+TRIGGER_LINE_X_RATIO = 0.40
+TRIGGER_LINE_TOLERANCE = 20 px
+```
+
+When the tracked bottle crosses the trigger line, accumulated measurements are finalized.
+
+### Missing-frame finalization
+
+If a tracked bottle is absent for:
+
+```text
+MAX_MISSING_FRAMES = 20
+```
+
+frames, the track is finalized through the missing-frame fallback.
 
 ## Saved Bottle Images
 
-Finalized bottles are saved under:
+The final implementation saves bottles by capacity and final status:
 
-    saved_bottles/
-
-with categories:
-
-    saved_bottles/
+```text
+saved_bottles/
+├── 100ml/
+│   ├── good/
+│   │   └── bottle_XXX/
+│   │       ├── original.jpg
+│   │       └── annotated.jpg
+│   ├── defective/
+│   └── incomplete/
+├── 300ml/
+│   ├── good/
+│   ├── defective/
+│   └── incomplete/
+└── 500ml/
     ├── good/
     ├── defective/
     └── incomplete/
+```
 
-Each saved bottle can contain:
+Each successfully saved bottle produces:
 
-    original.jpg
-    annotated.jpg
+```text
+1 bottle -> original.jpg + annotated.jpg
+```
 
-### Annotated Images
+`original.jpg` is the clean selected bottle crop.
 
-The annotated image may show:
+`annotated.jpg` contains the relevant inspection visualization, including the bottle bounding box, segmentation contour, orientation graphics, label information, centricity guides, defect boxes, and final result information.
 
-- Bottle bounding box
-- Bottle segmentation mask
-- Orientation axes
-- Label bounding box
-- H/V centricity lines
-- Damage boxes
-- Bump boxes
-- Final status
-- Capacity
-- Orientation result
-- H Center result
-- V Center result
-- Defect list
+The crop uses:
 
-For defective bottles, the pipeline prefers a complete bottle frame that also contains the confirmed defect annotation.
-
-If the exact defect-confirmation frame is partially clipped, the pipeline uses a complete defect snapshot when available and can reconstruct the confirmed defect position relative to the selected bottle frame.
-
-This prevents defective bottles from being unnecessarily cropped while preserving the visual defect annotation.
-
----
+```text
+MIN_BOTTLE_AREA = 20000 px²
+SAVE_PADDING = 20 px
+```
 
 ## CSV Logging
 
-Each run creates a timestamped CSV file:
+The CSV filename is capacity-specific:
 
-    results_YYYYMMDD_HHMMSS.csv
+```text
+results_100ml.csv
+results_300ml.csv
+results_500ml.csv
+```
 
-The CSV contains:
+The columns are:
 
-    Bottle
-    Capacity
-    Orientation
-    H_Center
-    V_Center
-    Defects
-    Timestamp
+```text
+Bottle
+Capacity
+Orientation
+H_Center
+V_Center
+Defects
+Timestamp
+```
 
-Example:
+## Camera Acquisition
 
-    Bottle,Capacity,Orientation,H_Center,V_Center,Defects,Timestamp
-    1,100,PASS,PASS,PASS,None,12:34:56
+The current script uses Harvester:
 
-Runtime result CSV files are intended for validation and inspection records.
+```python
+from harvesters.core import Harvester
+```
 
----
+The configured CTI path is machine-specific:
 
-## Current New Bottle Type Validation
+```text
+/home/xisai/Downloads/VimbaX_2026-2/cti/VimbaCameraSimulatorTL.cti
+```
 
-A recorded-frame validation was performed on the current new bottle type using:
+The camera path should be changed on another machine as required.
 
-    Frame source:
-    /home/xisai/Downloads/Capture_2026-07-15_07h53m14s
+## Installation
 
-    Frames:
-    1292
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-    Bottle type:
-    100 ml
+A conda environment can also be used:
 
-Final runtime result:
+```bash
+conda create -n frosch python=3.10
+conda activate frosch
+pip install -r requirements.txt
+```
 
-| Category | Count |
-|---|---:|
-| GOOD | 10 |
-| DEFECTIVE | 4 |
-| INCOMPLETE | 0 |
-| **Total** | **14** |
+The Python/PyTorch/CUDA combination must be compatible with the RF-DETR installation on the target system.
 
-The validation confirmed the following behaviors for the new bottle type:
+## Required Model Files
 
-- Bottle detection
-- Bottle segmentation
-- Bottle-mask alignment
-- Bottle tracking
-- Orientation
-- H centricity
-- V centricity using the new-bottle tolerance
-- Defect confirmation
-- Complete bottle saving
-- Defect-preserving saved annotations
-- 100 ml capacity reporting
-- GOOD / DEFECTIVE / INCOMPLETE finalization
+Before inference, the following checkpoints must be available:
 
-These counts are runtime validation observations and are not formal model accuracy metrics.
+```text
+runs/
+├── frosch_medium/
+│   └── checkpoint_best_regular.pth
+└── frosch_seg_medium/
+    └── checkpoint_best_total.pth
+```
 
----
+Model checkpoints are ignored by the repository `.gitignore` and should be managed through Git LFS or approved external storage.
 
-## Runtime Outputs
+## Running the Pipeline
 
-Runtime-generated files may include:
+### Live camera
 
-    results_*.csv
-    saved_bottles/
+```bash
+python live_inference.py --input camera --expected-capacity 500
+```
 
-Temporary debug and test outputs should not be treated as model evaluation metrics.
+Replace `500` with `100` or `300` for the corresponding bottle type.
 
----
+### Recorded folder
 
-## Validation Notes
+```bash
+python live_inference.py --input folder     --frame-dir /path/to/frames     --expected-capacity 500
+```
 
-The recorded-frame mode is recommended when validating a new bottle type because it provides a repeatable input sequence.
+The supported capacities are:
 
-A typical workflow is:
+```text
+100
+300
+500
+```
 
-    1. Capture a representative frame sequence.
-    2. Run the sequence using --input folder.
-    3. Set --expected-capacity for the bottle type.
-    4. Review GOOD results.
-    5. Review DEFECTIVE results.
-    6. Check segmentation-mask alignment.
-    7. Check H/V centricity.
-    8. Check orientation.
-    9. Check capacity.
-    10. Review saved annotated images.
-    11. Record final validation results.
+Example validation commands:
 
-When a new bottle type is introduced, its normal geometry and label position should be validated before changing the configured centricity thresholds.
----
+```bash
+python live_inference.py --input folder     --frame-dir /path/to/100ml_frames     --expected-capacity 100
+
+python live_inference.py --input folder     --frame-dir /path/to/300ml_frames     --expected-capacity 300
+
+python live_inference.py --input folder     --frame-dir /path/to/500ml_frames     --expected-capacity 500
+```
+
+Press `q` to stop the live display.
 
 ## Configuration Summary
 
-| Parameter | Current value | Purpose |
+| Parameter | Final value | Purpose |
 |---|---:|---|
-| Detection threshold | `0.40` | RF-DETR detection confidence |
-| Segmentation threshold | `0.30` | RF-DETR segmentation confidence |
+| Bottle confidence | `0.70` | Filters low-confidence bottle detections |
+| Label confidence | `0.35` | Label association |
+| Capacity confidence | `0.35` | Capacity candidate detection |
+| Bump confidence | `0.50` | Reduces bump false positives |
+| Damage confidence | `0.30` | Improves damage recall |
+| Scratch confidence | `0.30` | Low threshold for the undertrained class |
+| Segmentation threshold | `0.30` | Bottle-mask confidence |
 | Tracking IoU | `0.40` | Primary bottle matching |
 | Missing frames | `20` | Track finalization fallback |
 | Trigger line | `40%` of frame width | Bottle finalization |
-| Trigger tolerance | `20 px` | Minimum movement across trigger |
-| H centricity | `0.15` | Horizontal centricity threshold |
-| V centricity | `0.15` | Default vertical centricity threshold |
-| New-bottle V centricity | `0.20` | Vertical threshold for current new bottle type |
-| New-bottle aspect ratio | `0.45` | Identifies narrow/tall bottle geometry |
+| Trigger tolerance | `20 px` | Minimum trigger-line movement |
+| Complete X margin | `20 px` | Reliable complete-frame measurements |
+| H centricity | `0.15` | Horizontal offset limit |
+| 500 ml expected V | `0.01` | Capacity-specific V reference |
+| 100 ml expected V | `0.12` | Capacity-specific V reference |
+| 300 ml expected V | `0.07` | Capacity-specific V reference |
+| V deviation | `0.05` | Allowed V deviation |
 | Centricity jump tolerance | `0.08` | Reject sudden normalized-offset jumps |
-| Centricity minimum history | `3` | Warm-up before spatial jump filtering |
-| Centricity history window | `5` | Recent centricity samples retained |
+| Minimum reliable centricity observations | `3` | H/V stabilization |
 | Orientation limit | `45°` | Orientation PASS limit |
 | Defect mask overlap | `0.30` | Required defect/mask overlap |
-| Defect confirmation | `2 frames` | Consecutive-frame confirmation |
-| Minimum bottle area | `20000 px²` | Prevent tiny/partial saves |
+| Defect confirmation | `1 frame` | Valid defect acceptance |
+| Defect missing-frame tolerance | `1 frame` | Short detector gaps |
+| Minimum bottle area | `20000 px²` | Prevent partial/spurious saves |
 | Save padding | `20 px` | Crop padding |
 
----
+## Validation Results
 
-## Important Current Limitations
+Final recorded frame-folder validation was performed for all three bottle capacities on 21 August 2026. Runtime counts are validation observations, not formal precision/recall/F1/mAP metrics.
 
-The following points describe the current implementation:
+See `RESULTS.md` for the detailed run summary.
 
-1. The script does not currently call `cv2.undistort()`. Camera calibration/undistortion therefore needs to be handled upstream if required by the deployment setup.
-2. The script does not explicitly set RF-DETR inference to FP16. Runtime logs have indicated that the loaded RF-DETR models are not optimized for inference, so latency can be higher than an optimized deployment.
-3. The CTI path is machine-specific and must be changed on another system.
-4. The current code assumes the expected detector class names are present.
-5. The final GOOD / DEFECTIVE / INCOMPLETE counts are runtime inspection counts, not model accuracy metrics. A proper accuracy evaluation requires a ground-truth test set and sample-level comparison.
-6. Capacity OCR is used for recognition, while the final expected capacity can be supplied through `--expected-capacity` for a known bottle type.
-7. The segmentation model is used to obtain the bottle mask and orientation. Detector boxes remain the main source for bottle tracking and class-specific defect, label, and capacity candidates.
+## Training Documentation
 
----
+Training configuration is documented separately in:
 
-## Training and Evaluation
+```text
+FROSCH_TRAINING_REPORT.md
+```
 
-Model-training details are documented separately in:
-
-    FROSCH_TRAINING_REPORT.md
-
-The project documentation should not claim formal precision, recall, F1, mAP, or similar evaluation metrics unless those values have been measured and verified.
-
-Runtime bottle counts from recorded sequences are validation observations, not formal model accuracy measurements.
-
----
+Training metrics are only documented when they are available from actual training/evaluation artifacts.
 
 ## Bottle Image Saving Documentation
 
-Detailed bottle image-saving behavior is documented in:
+Detailed saving behavior is documented in:
 
-    FROSCH_BOTTLE_IMAGE_SAVING.md
+```text
+FROSCH_BOTTLE_IMAGE_SAVING.md
+```
 
-This document describes:
+## Repository Hygiene
 
-- Complete-frame selection
-- Defect-frame selection
-- Cropping
-- Annotation preservation
-- Saved-image organization
+See `.gitignore` for ignored runtime outputs, model artifacts, camera SDK files, local configuration, and temporary files.
 
----
+## Demo
+ 
+A live inference recording across all three bottle types (100 ml, 300 ml, 500 ml) is available here:
+ 
+[Live Inference Demo — 21 August 2026](https://drive.google.com/file/d/1o3kBGbjst0_tstIQagQg7lkvzcRYC_23/view?usp=sharing)
 
-## Git Notes
+## Current Status
 
-The canonical inference script is:
-
-    live_inference.py
-
-No separate inference script is required for folder testing.
-
-Use:
-
-    python live_inference.py --input camera
-
-for live camera inference and:
-
-    python live_inference.py \
-        --input folder \
-        --frame-dir /path/to/frames \
-        --expected-capacity 100
-
-for recorded-frame validation.
+- [x] RF-DETR bottle detection
+- [x] RF-DETR bottle segmentation
+- [x] Per-class confidence thresholds
+- [x] Bottle tracking
+- [x] Capacity OCR
+- [x] Capacity-specific expected V references
+- [x] Mask-based orientation
+- [x] Mask-based H/V centricity
+- [x] Centricity stabilization
+- [x] Damage validation
+- [x] Bump validation
+- [x] Defect confirmation
+- [x] GOOD / DEFECTIVE / INCOMPLETE classification
+- [x] Trigger-line finalization
+- [x] Missing-frame finalization
+- [x] Capacity-specific bottle saving
+- [x] Original bottle saving
+- [x] Annotated bottle saving
+- [x] CSV result logging
+- [x] Live camera input
+- [x] Recorded folder input
+- [x] Final validation across 100 ml, 300 ml, and 500 ml bottle runs

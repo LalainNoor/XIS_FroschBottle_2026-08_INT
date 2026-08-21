@@ -1,0 +1,27 @@
+Bottle,Capacity,Orientation,H_Center,V_Center,Defects,Timestamp
+1,300,2.180 deg (PASS),0.094 (PASS),0.133 (PASS),None,15:23:19
+2,Not detected,,0.248 (FAIL),0.198 (FAIL),None,15:23:21
+3,Not detected,0.089 deg (PASS),0.031 (PASS),0.120 (PASS),damage,15:23:21
+4,Not detected,2.996 deg (PASS),0.105 (PASS),0.132 (PASS),None,15:23:28
+5,Not detected,0.003 deg (PASS),0.025 (PASS),0.115 (PASS),None,15:23:30
+5,100,0.452 deg (PASS),0.054 (PASS),0.121 (PASS),None,15:23:30
+6,Not detected,3.202 deg (PASS),0.122 (PASS),0.134 (PASS),None,15:23:31
+6,100,0.579 deg (PASS),0.061 (PASS),0.119 (PASS),None,15:23:32
+7,Not detected,2.247 deg (PASS),0.142 (PASS),0.133 (PASS),None,15:23:36
+8,Not detected,0.694 deg (PASS),0.020 (PASS),0.116 (PASS),None,15:23:38
+8,100,1.375 deg (PASS),0.047 (PASS),0.131 (PASS),None,15:23:38
+9,Not detected,3.321 deg (PASS),0.175 (FAIL),0.139 (PASS),None,15:23:40
+10,Not detected,,0.093 (PASS),0.173 (FAIL),None,15:23:44
+11,Not detected,0.177 deg (PASS),0.166 (FAIL),0.123 (PASS),None,15:23:46
+12,Not detected,3.422 deg (PASS),0.104 (PASS),0.138 (PASS),None,15:23:47
+12,100,0.091 deg (PASS),0.013 (PASS),0.121 (PASS),None,15:23:48
+13,Not detected,3.531 deg (PASS),0.124 (PASS),0.128 (PASS),None,15:23:51
+13,100,2.645 deg (PASS),0.078 (PASS),0.138 (PASS),None,15:23:52
+14,Not detected,0.169 deg (PASS),0.059 (PASS),0.127 (PASS),None,15:23:53
+15,Not detected,,0.174 (FAIL),0.174 (FAIL),None,15:23:54
+16,Not detected,3.524 deg (PASS),0.146 (PASS),0.142 (PASS),None,15:24:01
+16,100,0.163 deg (PASS),0.026 (PASS),0.123 (PASS),None,15:24:02
+17,Not detected,0.370 deg (PASS),0.003 (PASS),0.125 (PASS),None,15:24:03
+18,Not detected,,0.248 (FAIL),0.192 (FAIL),None,15:24:05
+19,Not detected,0.361 deg (PASS),0.031 (PASS),0.123 (PASS),bump,15:24:06
+20,Not detected,3.601 deg (PASS),0.115 (PASS),0.141 (PASS),None,15:24:10
