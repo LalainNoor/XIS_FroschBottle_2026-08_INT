@@ -1,15 +1,28 @@
+import torch
+import supervision as sv
 import cv2
 import numpy as np
 import re
 import os
 import argparse
+import time
+import subprocess
+import psutil
+
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
 import easyocr
-from rfdetr import RFDETRMedium, RFDETRSegMedium
+import tensorrt as trt
+from torchvision.transforms import functional as TVF
 from harvesters.core import Harvester
 
 import csv
 from datetime import datetime
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 # -----------------------------
 # Runtime arguments / configuration
@@ -152,19 +165,397 @@ DEFECT_MAX_MISSING_FRAMES = 1
 # FIX 1: minimum bottle area to avoid saving spurious/partial detections
 MIN_BOTTLE_AREA = 20000
 
+# A track must be genuinely re-detected/matched across at least this many
+# separate frames before it is allowed to be saved/counted. Filters out
+# single-frame false-positive detections (empty conveyor, noise) that would
+# otherwise sit unmatched for MAX_MISSING_FRAMES and get flushed as a bogus
+# INCOMPLETE entry. Real bottles are matched dozens of times and clear this
+# trivially.
+MIN_MATCHED_FRAMES_TO_SAVE = 3
+
+# Mask-based duplicate track threshold:
+# if an unmatched bottle detection's mask overlaps an existing track's mask
+# by more than this fraction, it is the same physical bottle — skip new track.
+MASK_IOU_DUPLICATE_THRESH = 0.30
+
 SAVE_ROOT_DIR = os.path.join(os.getcwd(), "saved_bottles")
-SAVE_DIR = os.path.join(
-    SAVE_ROOT_DIR,
-    f"{EXPECTED_CAPACITY}ml",
-)
+SAVE_DIR = SAVE_ROOT_DIR
 
 SAVE_PADDING = 20
 
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 reader = easyocr.Reader(['en'], gpu=True)
-model = RFDETRMedium(pretrain_weights=CHECKPOINT)
-seg_model = RFDETRSegMedium(pretrain_weights=SEG_CHECKPOINT)
+
+# V23: run the expensive OCR call in a single background worker. Only one
+# OCR job is allowed at a time so EasyOCR/GPU access remains serialized.
+_ocr_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='frosch-ocr')
+_ocr_future = None
+_ocr_future_track_id = None
+_ocr_future_box = None
+# Step 7: native TensorRT inference.
+TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+
+class NativeTRTEngine:
+    def __init__(self, engine_path):
+        self.engine_path = engine_path
+
+        with open(engine_path, "rb") as f:
+            runtime = trt.Runtime(TRT_LOGGER)
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+
+        if self.engine is None:
+            raise RuntimeError(f"Failed to load TensorRT engine: {engine_path}")
+
+        self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError(f"Failed to create TensorRT context: {engine_path}")
+
+        # Use a dedicated non-default CUDA stream for TensorRT execution.
+        # This removes TensorRT's default-stream synchronization warning while
+        # keeping the existing inference/data flow unchanged.
+        self.stream = torch.cuda.Stream(device="cuda")
+
+        self.input_name = None
+        self.output_names = []
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                self.input_name = name
+            else:
+                self.output_names.append(name)
+
+        shape = tuple(self.engine.get_tensor_shape(self.input_name))
+        if len(shape) != 4 or shape[0] != 1 or shape[1] != 3:
+            raise RuntimeError(f"Unexpected input shape: {shape}")
+
+        self.input_h = int(shape[2])
+        self.input_w = int(shape[3])
+
+        # PERFORMANCE OPTIMIZATION 1:
+        # Reuse TensorRT GPU input/output buffers across frames instead of
+        # allocating new CUDA tensors on every inference.
+        # This does not change model inputs, outputs, thresholds, or decoding.
+        self._input_tensor = torch.empty(
+            (1, 3, self.input_h, self.input_w),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        self._output_tensors = {}
+        for name in self.output_names:
+            out_shape = tuple(self.engine.get_tensor_shape(name))
+            if any(d < 0 for d in out_shape):
+                raise RuntimeError(
+                    f"Dynamic output shape is unsupported: {name} {out_shape}"
+                )
+
+            np_dtype = trt.nptype(self.engine.get_tensor_dtype(name))
+            if np_dtype == np.float32:
+                torch_dtype = torch.float32
+            elif np_dtype == np.float16:
+                torch_dtype = torch.float16
+            elif np_dtype == np.int32:
+                torch_dtype = torch.int32
+            elif np_dtype == np.int64:
+                torch_dtype = torch.int64
+            else:
+                raise RuntimeError(
+                    f"Unsupported TensorRT output dtype: {name} {np_dtype}"
+                )
+
+            out = torch.empty(
+                out_shape,
+                dtype=torch_dtype,
+                device="cuda",
+            )
+            self._output_tensors[name] = out
+
+        self.context.set_tensor_address(
+            self.input_name,
+            self._input_tensor.data_ptr(),
+        )
+        for name, out in self._output_tensors.items():
+            self.context.set_tensor_address(name, out.data_ptr())
+
+        print(
+            f"[OPTIMIZATION] TensorRT loaded: {engine_path} | "
+            f"input={self.input_h}x{self.input_w} | outputs={self.output_names}"
+        )
+        print("[OPTIMIZATION] Persistent TensorRT CUDA buffers: enabled")
+
+    def infer(self, frame):
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(
+            rgb,
+            (self.input_w, self.input_h),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+        normalized = resized.astype(np.float32) / 255.0
+        normalized -= np.array(
+            [0.485, 0.456, 0.406],
+            dtype=np.float32,
+        )
+        normalized /= np.array(
+            [0.229, 0.224, 0.225],
+            dtype=np.float32,
+        )
+
+        chw = np.ascontiguousarray(
+            np.transpose(normalized, (2, 0, 1))
+        )
+
+        with torch.cuda.stream(self.stream):
+            self._input_tensor.copy_(
+                torch.from_numpy(chw).unsqueeze(0),
+                non_blocking=True,
+            )
+
+            if not self.context.execute_async_v3(
+                self.stream.cuda_stream
+            ):
+                raise RuntimeError(
+                    f"TensorRT execution failed: {self.engine_path}"
+                )
+
+        self.stream.synchronize()
+
+        return {
+            name: tensor.detach().float().cpu().numpy()
+            for name, tensor in self._output_tensors.items()
+        }
+
+
+def _load_class_names():
+    """Load the exact trained class-name order from the RF-DETR checkpoint."""
+    try:
+        import torch as _torch
+        for ckpt_path in (
+            CHECKPOINT,
+            SEG_CHECKPOINT,
+        ):
+            ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            args = ckpt.get("args") if isinstance(ckpt, dict) else None
+            if args is not None:
+                names = getattr(args, "classes", None)
+                if names:
+                    return list(names)
+
+            if isinstance(ckpt, dict):
+                for key in ("class_names", "classes", "names"):
+                    names = ckpt.get(key)
+                    if names:
+                        return list(names)
+    except Exception as exc:
+        print(f"[WARNING] Could not read class names from checkpoint: {exc}")
+
+    CLASS_NAMES = [
+        "Frosch-bottle-UTNY-aUbJ-XBXs",
+        "bottle",
+        "bump",
+        "capacity",
+        "damage",
+        "label",
+        "scratch",
+    ]
+
+CLASS_NAMES = [
+    "Frosch-bottle-UTNY-aUbJ-XBXs",
+    "bottle",
+    "bump",
+    "capacity",
+    "damage",
+    "label",
+    "scratch",
+]
+
+print(f"[OPTIMIZATION] TensorRT class map: {CLASS_NAMES}")
+
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -88.0, 88.0)))
+
+
+def decode_rfdetr_outputs(raw, frame_shape, score_threshold, keep_masks=False):
+    if "dets" not in raw or "labels" not in raw:
+        raise RuntimeError(f"Expected dets/labels outputs, got {list(raw)}")
+
+    boxes_cwh = raw["dets"][0]
+    logits_all = raw["labels"][0]
+
+    logits = logits_all[:, :-1]
+    probs = _sigmoid(logits)
+
+    flat = probs.reshape(-1)
+    k = min(boxes_cwh.shape[0], flat.size)
+    order = np.argsort(-flat, kind="stable")[:k]
+
+    scores = flat[order]
+    num_classes = probs.shape[1]
+    query_idx = order // num_classes
+    class_ids = order % num_classes
+
+    keep = scores > score_threshold
+    scores = scores[keep]
+    query_idx = query_idx[keep]
+    class_ids = class_ids[keep]
+
+    boxes = boxes_cwh[query_idx]
+    h, w = frame_shape[:2]
+
+    cx, cy, bw, bh = boxes.T
+    xyxy = np.stack(
+        [
+            (cx - bw / 2) * w,
+            (cy - bh / 2) * h,
+            (cx + bw / 2) * w,
+            (cy + bh / 2) * h,
+        ],
+        axis=1,
+    )
+
+    xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], 0, w)
+    xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0, h)
+
+    detections = sv.Detections(
+        xyxy=xyxy.astype(np.float32),
+        confidence=scores.astype(np.float32),
+        class_id=class_ids.astype(int),
+    )
+
+    detections.data["class_name"] = np.array(
+        [
+            CLASS_NAMES[int(cid)] if int(cid) < len(CLASS_NAMES)
+            else f"class_{int(cid)}"
+            for cid in class_ids
+        ],
+        dtype=object,
+    )
+
+    detections.data["_rfdetr_query_idx"] = query_idx.astype(np.int32)
+
+    if keep_masks and "masks" in raw:
+        raw_masks = raw["masks"][0]
+        selected_masks = raw_masks[query_idx]
+
+        mask_tensor = torch.from_numpy(selected_masks).float().unsqueeze(1)
+        mask_tensor = torch.nn.functional.interpolate(
+            mask_tensor,
+            size=(h, w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+
+        selected_masks_full = (mask_tensor.sigmoid() > 0.5).cpu().numpy()
+        detections.mask = selected_masks_full
+
+    return detections
+
+
+def trt_predict(runtime_model, frame, threshold, keep_masks=False):
+    raw = runtime_model.infer(frame)
+    return decode_rfdetr_outputs(
+        raw,
+        frame.shape,
+        threshold,
+        keep_masks=keep_masks,
+    )
+
+
+model = NativeTRTEngine("output/rfdetr-medium.trt")
+seg_model = NativeTRTEngine("output/rfdetr-seg-medium.trt")
+
+print("[OPTIMIZATION] Native TensorRT backend: enabled for detection + segmentation.")
+print("[OPTIMIZATION] TensorRT engines initialized once: enabled.")
+
+class ResourceMonitor:
+    """Low-overhead FPS/CPU/GPU monitor for the live display."""
+
+    def __init__(self, poll_interval=0.5):
+        self.poll_interval = poll_interval
+        self.last_poll = 0.0
+        self.cpu_percent = 0.0
+        self.gpu_percent = None
+        self.gpu_mem_used = None
+        self.gpu_mem_total = None
+        self.nvml_handle = None
+
+        psutil.cpu_percent(interval=None)
+
+        if pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
+                self.gpu_mem_total = mem.total
+            except Exception:
+                self.nvml_handle = None
+
+    def update(self):
+        now = time.perf_counter()
+        if now - self.last_poll < self.poll_interval:
+            return
+
+        self.last_poll = now
+        self.cpu_percent = psutil.cpu_percent(interval=None)
+
+        if self.nvml_handle is not None:
+            try:
+                util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
+                mem = pynvml.nvmlDeviceGetMemoryInfo(self.nvml_handle)
+                self.gpu_percent = util.gpu
+                self.gpu_mem_used = mem.used
+                self.gpu_mem_total = mem.total
+                return
+            except Exception:
+                pass
+
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=0.15,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                gpu, used, total = result.stdout.strip().splitlines()[0].split(", ")
+                self.gpu_percent = float(gpu)
+                self.gpu_mem_used = float(used) * 1024 * 1024
+                self.gpu_mem_total = float(total) * 1024 * 1024
+        except Exception:
+            pass
+
+    def text(self, fps):
+        gpu_text = f"{self.gpu_percent:.0f}%" if self.gpu_percent is not None else "N/A"
+        if self.gpu_mem_used is not None and self.gpu_mem_total:
+            vram_text = (
+                f"{self.gpu_mem_used / (1024**3):.1f}/"
+                f"{self.gpu_mem_total / (1024**3):.1f}GB"
+            )
+        else:
+            vram_text = "N/A"
+        return f"FPS: {fps:.1f} | CPU: {self.cpu_percent:.0f}% | GPU: {gpu_text} | VRAM: {vram_text}"
+
+    def close(self):
+        if self.nvml_handle is not None and pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+
+resource_monitor = ResourceMonitor()
+fps = 0.0
+active_fps = 0.0  # smoothed FPS for active-bottle frames only
+
+recently_saved_boxes = []   # [(box, ttl_remaining)]
+RECENTLY_SAVED_TTL = 40     # frames to block re-detection after save
 
 bottle_count = 0
 completed_count = 0
@@ -187,12 +578,6 @@ def extract_capacity(text):
     return None
 
 def run_ocr(image, box):
-    """
-    Run capacity OCR using several lightweight preprocessing variants.
-
-    The detector box and capacity classes are unchanged. We only make
-    the OCR step more tolerant to low contrast, blur, and label glare.
-    """
     x1, y1, x2, y2 = map(int, box)
     h, w = image.shape[:2]
 
@@ -204,6 +589,8 @@ def run_ocr(image, box):
     x2 = min(w, x2 + pad_x)
     y2 = min(h, y2 + pad_y)
 
+    _ocr_pre_start = time.perf_counter()
+
     crop = image[y1:y2, x1:x2]
 
     if crop.size == 0:
@@ -211,7 +598,6 @@ def run_ocr(image, box):
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-    # Upscale once and reuse the same image for all OCR variants.
     gray = cv2.resize(
         gray,
         None,
@@ -245,45 +631,174 @@ def run_ocr(image, box):
         ),
     ]
 
-    candidates = []
+    ocr_batch_v13["preprocessing"] += time.perf_counter() - _ocr_pre_start
 
-    for variant in variants:
-        results = reader.readtext(
-            variant,
-            allowlist="0123456789",
-            paragraph=False,
-        )
-
+    def _extract_valid_candidates(results):
+        valid_candidates = []
         for (_, text_value, conf) in results:
             if conf < 0.15:
                 continue
-
             cap = extract_capacity(text_value)
-
             if cap in {100, 300, 500}:
-                candidates.append((cap, float(conf)))
+                valid_candidates.append((cap, float(conf)))
+        return valid_candidates
 
-    if not candidates:
-        return None
-
-    # Prefer the capacity supported by the largest number of OCR
-    # variants; use highest confidence as the tie-breaker.
-    counts = Counter(cap for cap, _ in candidates)
-
-    best_capacity = max(
-        counts,
-        key=lambda cap: (
-            counts[cap],
-            max(
-                confidence
-                for candidate, confidence in candidates
-                if candidate == cap
+    def _select_capacity(valid_candidates):
+        if not valid_candidates:
+            return None
+        counts = Counter(cap for cap, _ in valid_candidates)
+        return max(
+            counts,
+            key=lambda cap: (
+                counts[cap],
+                max(
+                    confidence
+                    for candidate, confidence in valid_candidates
+                    if candidate == cap
+                ),
             ),
-        ),
+        )
+
+    _ocr_v1_start = time.perf_counter()
+    first_results = reader.readtext(
+        variants[0],
+        allowlist="0123456789",
+        paragraph=False,
+    )
+    ocr_variant_times["variant1"] += time.perf_counter() - _ocr_v1_start
+    ocr_variant_counts["variant1"] += 1
+
+    first_candidates = _extract_valid_candidates(first_results)
+    if first_candidates:
+        return _select_capacity(first_candidates)
+
+    remaining_variants = variants[1:]
+
+    _prep_batch_start = time.perf_counter()
+    _batch_dims = [(int(v.shape[1]), int(v.shape[0])) for v in remaining_variants]
+    ocr_batch_v13["batch_prepare"] += time.perf_counter() - _prep_batch_start
+    ocr_batch_v13["batch_calls"] += 1
+    ocr_batch_v13["images_total"] += len(remaining_variants)
+    for _bw, _bh in _batch_dims:
+        ocr_batch_v13["width_sum"] += _bw
+        ocr_batch_v13["height_sum"] += _bh
+        ocr_batch_v13["width_min"] = _bw if ocr_batch_v13["width_min"] is None else min(ocr_batch_v13["width_min"], _bw)
+        ocr_batch_v13["width_max"] = _bw if ocr_batch_v13["width_max"] is None else max(ocr_batch_v13["width_max"], _bw)
+        ocr_batch_v13["height_min"] = _bh if ocr_batch_v13["height_min"] is None else min(ocr_batch_v13["height_min"], _bh)
+        ocr_batch_v13["height_max"] = _bh if ocr_batch_v13["height_max"] is None else max(ocr_batch_v13["height_max"], _bh)
+
+    OCR_BATCH_MAX_DIM_V14 = 512
+    _resize_start = time.perf_counter()
+    resized_variants = []
+    for _img in remaining_variants:
+        _h, _w = _img.shape[:2]
+        _max_dim = max(_w, _h)
+        if _max_dim > OCR_BATCH_MAX_DIM_V14:
+            _scale = OCR_BATCH_MAX_DIM_V14 / float(_max_dim)
+            _new_w = max(1, int(round(_w * _scale)))
+            _new_h = max(1, int(round(_h * _scale)))
+            _img = cv2.resize(_img, (_new_w, _new_h), interpolation=cv2.INTER_AREA)
+        resized_variants.append(_img)
+    ocr_batch_v13["preprocessing"] += time.perf_counter() - _resize_start
+
+    if hasattr(reader, "readtext_batched"):
+        _ocr_batch_start = time.perf_counter()
+        batched_results = reader.readtext_batched(
+            resized_variants,
+            batch_size=len(resized_variants),
+            allowlist="0123456789",
+            paragraph=False,
+        )
+        _batch_elapsed = time.perf_counter() - _ocr_batch_start
+        ocr_batch_v13["inference"] += _batch_elapsed
+        ocr_variant_times["variants2_4_batch"] += _batch_elapsed
+        ocr_variant_counts["variants2_4_batch"] += 1
+    else:
+        _ocr_batch_start = time.perf_counter()
+        batched_results = [
+            reader.readtext(
+                variant,
+                allowlist="0123456789",
+                paragraph=False,
+            )
+            for variant in remaining_variants
+        ]
+        _batch_elapsed = time.perf_counter() - _ocr_batch_start
+        ocr_batch_v13["inference"] += _batch_elapsed
+        ocr_variant_times["variants2_4_batch"] += _batch_elapsed
+        ocr_variant_counts["variants2_4_batch"] += 1
+
+    _parse_start = time.perf_counter()
+    all_candidates = []
+    for results in batched_results:
+        candidates = _extract_valid_candidates(results)
+        if candidates:
+            all_candidates.extend(candidates)
+    ocr_batch_v13["parsing"] += time.perf_counter() - _parse_start
+
+    return _select_capacity(all_candidates)
+
+
+def _ocr_box_is_still_compatible(last_box, current_box):
+    if last_box is None or current_box is None:
+        return False
+    lc = box_center(last_box)
+    cc = box_center(current_box)
+    lw = max(1.0, float(last_box[2] - last_box[0]))
+    lh = max(1.0, float(last_box[3] - last_box[1]))
+    cw = max(1.0, float(current_box[2] - current_box[0]))
+    ch = max(1.0, float(current_box[3] - current_box[1]))
+    center_shift = ((cc[0] - lc[0]) ** 2 + (cc[1] - lc[1]) ** 2) ** 0.5
+    size_change = max(abs(cw - lw) / lw, abs(ch - lh) / lh)
+    return (
+        center_shift <= max(12.0, 0.20 * max(lw, lh))
+        and size_change <= 0.12
     )
 
-    return best_capacity
 
+def _submit_async_ocr(track, frame, cap_box):
+    global _ocr_future, _ocr_future_track_id, _ocr_future_box
+    if _ocr_future is not None and not _ocr_future.done():
+        return False
+    job_frame = frame.copy()
+    job_box = tuple(cap_box)
+    _ocr_future = _ocr_executor.submit(run_ocr, job_frame, job_box)
+    _ocr_future_track_id = track["id"]
+    _ocr_future_box = job_box
+    return True
+
+
+def _poll_async_ocr(track, current_cap_box=None):
+    global _ocr_future, _ocr_future_track_id, _ocr_future_box
+    if _ocr_future is None or not _ocr_future.done():
+        return None
+
+    future = _ocr_future
+    future_track_id = _ocr_future_track_id
+    future_box = _ocr_future_box
+    _ocr_future = None
+    _ocr_future_track_id = None
+    _ocr_future_box = None
+
+    if future_track_id != track.get("id"):
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"[WARNING] Async OCR failed: {exc}")
+        return None
+
+    if current_cap_box is not None and not _ocr_box_is_still_compatible(future_box, current_cap_box):
+        try:
+            future.result()
+        except Exception as exc:
+            print(f"[WARNING] Async OCR failed: {exc}")
+        return None
+
+    try:
+        return future.result()
+    except Exception as exc:
+        print(f"[WARNING] Async OCR failed: {exc}")
+        return None
 
 def iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -298,8 +813,32 @@ def iou(boxA, boxB):
     return inter / float(areaA + areaB - inter)
 
 
+def mask_iou(mask_a, mask_b):
+    if mask_a is None or mask_b is None:
+        return 0.0
+    inter = float(np.logical_and(mask_a, mask_b).sum())
+    if inter == 0.0:
+        return 0.0
+    union = float(np.logical_or(mask_a, mask_b).sum())
+    return inter / max(1.0, union)
+
+
+def deduplicate_boxes(boxes, iou_thresh=0.65):
+    if len(boxes) <= 1:
+        return list(boxes)
+    kept = []
+    for box in boxes:
+        if not any(iou(box, k) > iou_thresh for k in kept):
+            kept.append(box)
+        else:
+            print(
+                f"[DEDUP] Dropped duplicate bottle box "
+                f"({int(box[0])},{int(box[1])},{int(box[2])},{int(box[3])})"
+            )
+    return kept
+
+
 def stable_capacity(values):
-    """Return the most frequently observed valid capacity."""
     clean = [
         int(v)
         for v in values
@@ -318,14 +857,6 @@ def box_center(box):
 
 
 def bottle_track_match(current_box, previous_box):
-    """
-    Match the current bottle to an existing track.
-
-    IoU remains the primary/strict match. If the bottle moves enough that
-    IoU drops below the normal threshold, allow a conservative center-based
-    fallback. This is intended for normal frame-to-frame motion, not for
-    unrelated bottles.
-    """
     if iou(current_box, previous_box) > IOU_THRESHOLD:
         return True
 
@@ -343,8 +874,6 @@ def bottle_track_match(current_box, previous_box):
     horizontal_distance = abs(cx - px)
     vertical_distance = abs(cy - py)
 
-    # Bottles mainly move horizontally through the inspection view.
-    # Keep the vertical gate tighter to avoid merging nearby bottles.
     return (
         horizontal_distance <= max_w * 0.75
         and vertical_distance <= max_h * 0.45
@@ -352,27 +881,68 @@ def bottle_track_match(current_box, previous_box):
 
 
 def get_mask_orientation(mask):
-    """Calculate bottle orientation from actual bottle-mask pixels."""
     if mask is None:
         return None
 
-    mask_u8 = mask.astype(np.uint8) * 255
-    ys, xs = np.where(mask_u8 > 0)
+    _v16_t = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
+
+    _mask_u8 = mask.astype(np.uint8, copy=False)
+    _points = cv2.findNonZero(_mask_u8)
+    if _points is None or len(_points) < 20:
+        if ACTIVE_PROFILE_THIS_FRAME:
+            orientation_profile_times["mask_pixels"] += time.perf_counter() - _v16_t
+        return None
+    _points = _points.reshape(-1, 2)
+    xs = _points[:, 0]
+    ys = _points[:, 1]
     if len(xs) < 20:
+        if ACTIVE_PROFILE_THIS_FRAME:
+            orientation_profile_times["mask_pixels"] += time.perf_counter() - _v16_t
         return None
 
-    points = np.column_stack((xs, ys)).astype(np.float32)
-    center = points.mean(axis=0)
-    centered = points - center
-    covariance = np.cov(centered, rowvar=False)
+    xs = xs.astype(np.float32, copy=False)
+    ys = ys.astype(np.float32, copy=False)
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["mask_pixels"] += time.perf_counter() - _v16_t
 
+    _v16_t = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
+    if ACTIVE_PROFILE_THIS_FRAME: _v19_t = time.perf_counter()
+    center_x = float(xs.mean())
+    center_y = float(ys.mean())
+    n = float(len(xs))
+    if ACTIVE_PROFILE_THIS_FRAME: orientation_profile_times["centering_mean"] += time.perf_counter() - _v19_t
+
+    if ACTIVE_PROFILE_THIS_FRAME: _v19_t = time.perf_counter()
+    sum_x2 = float(np.dot(xs, xs))
+    sum_xy = float(np.dot(xs, ys))
+    sum_y2 = float(np.dot(ys, ys))
+    if ACTIVE_PROFILE_THIS_FRAME: orientation_profile_times["centering_demean"] += time.perf_counter() - _v19_t
+
+    if ACTIVE_PROFILE_THIS_FRAME: _v19_t = time.perf_counter()
+    denom = max(1.0, n - 1.0)
+    cov_xx = (sum_x2 - n * center_x * center_x) / denom
+    cov_xy = (sum_xy - n * center_x * center_y) / denom
+    cov_yy = (sum_y2 - n * center_y * center_y) / denom
+    covariance = np.array(
+        [[cov_xx, cov_xy], [cov_xy, cov_yy]],
+        dtype=np.float64,
+    )
+    if ACTIVE_PROFILE_THIS_FRAME: orientation_profile_times["centering_covariance_ops"] += time.perf_counter() - _v19_t
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["centering_covariance"] += time.perf_counter() - _v16_t
+
+    _v16_t = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
     if covariance.shape != (2, 2) or not np.all(np.isfinite(covariance)):
+        if ACTIVE_PROFILE_THIS_FRAME:
+            orientation_profile_times["eigen_angle"] += time.perf_counter() - _v16_t
         return None
 
     eigenvalues, eigenvectors = np.linalg.eigh(covariance)
     major = eigenvectors[:, int(np.argmax(eigenvalues))].astype(np.float32)
     norm = float(np.linalg.norm(major))
     if norm < 1e-6:
+        if ACTIVE_PROFILE_THIS_FRAME:
+            orientation_profile_times["eigen_angle"] += time.perf_counter() - _v16_t
         return None
 
     major /= norm
@@ -389,25 +959,53 @@ def get_mask_orientation(mask):
             )
         )
     )
-
     status = "PASS" if angle_deg <= ORIENTATION_MAX_ANGLE_DEG else "FAIL"
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["eigen_angle"] += time.perf_counter() - _v16_t
 
-    projections = centered @ major
+    _v16_t = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
+    if ACTIVE_PROFILE_THIS_FRAME: _v20_t = time.perf_counter()
+    major_x = float(major[0])
+    major_y = float(major[1])
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["projection_center"] += time.perf_counter() - _v20_t
+
+    if ACTIVE_PROFILE_THIS_FRAME: _v20_t = time.perf_counter()
+    projections = (xs - center_x) * major_x + (ys - center_y) * major_y
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["projection_dot"] += time.perf_counter() - _v20_t
+
+    if ACTIVE_PROFILE_THIS_FRAME: _v20_t = time.perf_counter()
     half_length = max(20.0, float(np.max(np.abs(projections))))
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["projection_max"] += time.perf_counter() - _v20_t
+        orientation_profile_times["projection"] += time.perf_counter() - _v16_t
 
-    # Keep the external contour so the actual segmentation mask can be
-    # visualized later on both the live frame and the saved annotated image.
-    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    _v16_t = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
+    if ACTIVE_PROFILE_THIS_FRAME: _v18_t = time.perf_counter()
+    mask_u8 = mask.astype(np.uint8) * 255
+    if ACTIVE_PROFILE_THIS_FRAME: orientation_profile_times["contour_prepare"] += time.perf_counter() - _v18_t
+    if ACTIVE_PROFILE_THIS_FRAME: _v18_t = time.perf_counter()
+    contours, _ = cv2.findContours(
+        mask_u8,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE,
+    )
+    if ACTIVE_PROFILE_THIS_FRAME: orientation_profile_times["contour_find"] += time.perf_counter() - _v18_t
+    if ACTIVE_PROFILE_THIS_FRAME: _v18_t = time.perf_counter()
     mask_contour = None
     if contours:
         mask_contour = max(contours, key=cv2.contourArea)
         if cv2.contourArea(mask_contour) < 20:
             mask_contour = None
+    if ACTIVE_PROFILE_THIS_FRAME: orientation_profile_times["contour_select"] += time.perf_counter() - _v18_t
+    if ACTIVE_PROFILE_THIS_FRAME:
+        orientation_profile_times["contour"] += time.perf_counter() - _v16_t
 
     return {
         "status": status,
         "angle_deg": angle_deg,
-        "center": (float(center[0]), float(center[1])),
+        "center": (center_x, center_y),
         "major": (float(major[0]), float(major[1])),
         "minor": (float(minor[0]), float(minor[1])),
         "half_length": half_length,
@@ -416,7 +1014,6 @@ def get_mask_orientation(mask):
 
 
 def find_bottle_mask(bottle_box, segmentation_detections):
-    """Match a detector bottle to its segmentation bottle mask."""
     if segmentation_detections is None or segmentation_detections.mask is None:
         return None
 
@@ -442,10 +1039,12 @@ def find_bottle_mask(bottle_box, segmentation_detections):
 def get_mask_centroid(mask):
     if mask is None:
         return None
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
+    binary = mask.astype(np.uint8, copy=False)
+    moments = cv2.moments(binary, binaryImage=True)
+    area = moments["m00"]
+    if area <= 0.0:
         return None
-    return (float(xs.mean()), float(ys.mean()))
+    return (float(moments["m10"] / area), float(moments["m01"] / area))
 
 def find_label_mask(bottle_box, seg_detections, frame):
     if seg_detections is None or seg_detections.mask is None:
@@ -466,7 +1065,6 @@ def find_label_mask(bottle_box, seg_detections, frame):
     return constrain_mask_to_box(best_mask, bottle_box)
 
 def resize_mask_to_frame(mask, frame):
-    """Resize seg model mask to match frame resolution."""
     if mask is None:
         return None
     fh, fw = frame.shape[:2]
@@ -478,12 +1076,6 @@ def resize_mask_to_frame(mask, frame):
 
 
 def constrain_mask_to_box(mask, box):
-    """
-    Zero out mask pixels outside the detection bounding box.
-    Fixes letterbox/padding misalignment: even if the seg model mask is in
-    a padded coordinate space, we trust the detection box and only keep
-    mask pixels inside it.
-    """
     if mask is None:
         return None
     x1, y1, x2, y2 = [int(v) for v in box]
@@ -497,7 +1089,6 @@ def constrain_mask_to_box(mask, box):
 
 
 def draw_mask_contour(image, orientation_data, color=(0, 255, 0), thickness=3, fill=False):
-    """Draw the actual RF-DETR bottle segmentation mask outline."""
     if orientation_data is None:
         return
 
@@ -517,7 +1108,6 @@ def draw_mask_contour(image, orientation_data, color=(0, 255, 0), thickness=3, f
 
 
 def draw_mask_orientation(image, orientation_data, color=(255, 0, 0), thickness=3):
-    """Draw orientation axes derived from bottle-mask geometry."""
     if orientation_data is None:
         return
 
@@ -551,10 +1141,6 @@ def draw_mask_orientation(image, orientation_data, color=(255, 0, 0), thickness=
     cv2.drawMarker(image, (cx, cy), color, cv2.MARKER_CROSS, 18, 2)
 
 def is_reliable_bottle_frame(box, frame_shape):
-    """
-    Return True only when the bottle is sufficiently inside
-    the camera frame to provide a reliable centricity measurement.
-    """
     frame_h, frame_w = frame_shape[:2]
     x1, y1, x2, y2 = map(int, box)
 
@@ -571,13 +1157,6 @@ def check_centricity(
     bottle_mask=None,
     label_mask=None,
 ):
-    """
-    Calculate centricity from segmentation-mask centroids.
-
-    Masks are the primary source for bottle/label centers so the same
-    geometry is used for both bottle types. Bounding-box centers are only
-    used as a fallback when a corresponding mask is unavailable.
-    """
     bottle_c = get_mask_centroid(bottle_mask)
     label_c = get_mask_centroid(label_mask)
 
@@ -607,10 +1186,6 @@ def check_centricity(
     )
 
 def has_crossed_trigger_line(track, box, frame_width):
-    """
-    Detect whether the tracked bottle center crossed the trigger line.
-    This only controls bottle finalization.
-    """
     line_x = int(frame_width * TRIGGER_LINE_X_RATIO)
 
     current_center_x = (box[0] + box[2]) / 2.0
@@ -665,6 +1240,9 @@ def create_track(box):
         "missing": 0,
         "saved": False,
         "frames_seen": 0,
+        # Counts frames where this track was actually matched to a
+        # detection (not merely frames elapsed since creation).
+        "matched_frames": 1,
         "previous_center_x": None,
         "trigger_crossed": False,
         "best_box": box,
@@ -680,8 +1258,6 @@ def create_track(box):
         "best_defect_damage_boxes": [],
         "best_defect_bump_boxes": [],
 
-        # Best confirmed-defect snapshot where the complete bottle is
-        # fully inside the source frame. Used only for saved annotation.
         "best_complete_defect_frame": None,
         "best_complete_defect_box": None,
         "best_complete_defect_label_box": None,
@@ -689,9 +1265,6 @@ def create_track(box):
         "best_complete_defect_bump_boxes": [],
         "best_complete_defect_orientation_data": None,
 
-        # Defect boxes normalized to the bottle box. Used only as a
-        # visualization fallback when the saved frame differs from
-        # the original confirmed-defect frame.
         "best_defect_damage_relative": [],
         "best_defect_bump_relative": [],
 
@@ -703,22 +1276,28 @@ def create_track(box):
         "best_valid_h_center": None,
         "best_valid_v_center": None,
         "best_valid_centricity_error": None,
-        # Signed normalized label-to-bottle center offsets.
-        # These are frame-motion invariant and are used to reject
-        # occasional label-association/box-jitter outliers.
         "centricity_offset_history": [],
         "h_history": [],
         "v_history": [],
         "orientation_history": [],
-        # Numeric measurements retained separately from PASS/FAIL histories.
-        # H/V values are absolute normalized label-to-bottle center offsets.
         "h_value_history": [],
         "v_value_history": [],
+        "h_px_history": [],
+        "v_px_history": [],
         "orientation_angle_history": [],
         "final_h_value": None,
         "final_v_value": None,
         "final_orientation_angle": None,
         "capacity_history": [],
+        "ocr_capacity_locked": False,
+        "ocr_last_capacity": None,
+        "ocr_same_capacity_count": 0,
+        "ocr_last_box": None,
+        "ocr_cached_capacity": None,
+        "ocr_cache_age": 0,
+        "ocr_frames_since_inference": 0,
+        "ocr_temporal_interval": 3,
+        "ocr_async_pending": False,
         "finalized": False,
         "final_status": None,
     }
@@ -727,7 +1306,6 @@ def create_track(box):
 
 
 def majority_result(values):
-    """Return the majority PASS/FAIL value, or None if there is no measurement."""
     clean = [v for v in values if v in {"PASS", "FAIL"}]
     if not clean:
         return None
@@ -737,7 +1315,6 @@ def majority_result(values):
 
 
 def stable_result(values):
-    """Return a stable majority result once enough measurements exist."""
     result = majority_result(values)
     if result is None:
         return None
@@ -745,7 +1322,6 @@ def stable_result(values):
 
 
 def stable_numeric(values):
-    """Return a robust representative numeric measurement."""
     clean = [
         float(v)
         for v in values
@@ -759,7 +1335,6 @@ def stable_numeric(values):
 
 
 def format_measurement(value, status, suffix=""):
-    """Format a numeric measurement with its existing PASS/FAIL status."""
     if value is None:
         return status or "N/A"
 
@@ -770,7 +1345,6 @@ def format_measurement(value, status, suffix=""):
 
 
 def finalize_measurements(track):
-    """Freeze the final bottle state from accumulated observations."""
     h_values = [
         abs(float(x))
         for x in track.get("h_value_history", [])
@@ -802,9 +1376,6 @@ def finalize_measurements(track):
     else:
         v = "Pending"
 
-    # Fallback: if still Pending but a saved complete label box exists,
-    # compute a one-shot centricity so the bottle is not left INCOMPLETE
-    # solely because the label was never detected in a "reliable" frame window.
     if h == "Pending" or v == "Pending":
         fallback_box = track.get("best_complete_box")
         fallback_label = track.get("best_complete_label_box")
@@ -838,9 +1409,6 @@ def finalize_measurements(track):
     orientation = majority_result(
         track.get("orientation_history", [])
     )
-    # Freeze representative numeric measurements independently from the
-    # categorical PASS/FAIL majority result.
-    # Preserve fallback values set above; only overwrite if history data exists.
     h_numeric = stable_numeric([abs(v) for v in track.get("h_value_history", [])])
     v_numeric = stable_numeric([abs(v) for v in track.get("v_value_history", [])])
     if h_numeric is not None:
@@ -851,8 +1419,6 @@ def finalize_measurements(track):
         track.get("orientation_angle_history", [])
     )
 
-    # If a measurement was never available, keep it as Pending/N/A rather
-    # than silently converting missing data into FAIL.
     if track["h_center"] is None:
         track["h_center"] = "Pending"
     if track["v_center"] is None:
@@ -860,15 +1426,11 @@ def finalize_measurements(track):
     if track["orientation"] is None:
         track["orientation"] = "Pending"
 
-    # If capacity was never read by OCR, fall back to the expected capacity
-    # passed via --expected-capacity. All bottles in a single run are the
-    # same type, so this is always correct for the current run.
     if track.get("capacity") is None:
         track["capacity"] = EXPECTED_CAPACITY
 
     track["finalized"] = True
 
-    # Missing measurements are INCOMPLETE, not DEFECTIVE.
     missing_measurement = any(
         track[key] == "Pending"
         for key in ("orientation", "h_center", "v_center")
@@ -903,17 +1465,8 @@ def analyze_bottle(frame, bottle_box, capacity_boxes, label_boxes, damage_boxes,
             and cap_box[1] >= bottle_box[1] - _cap_tol
             and cap_box[3] <= bottle_box[3] + _cap_tol
         ):
-            cap = run_ocr(frame, cap_box)
-            if cap:
-                result["capacity"] = cap
-                break
+            break
 
-    # H/V centricity is intentionally not calculated here.
-    # It is calculated through update_centricity() so the live path uses
-    # the same mask-based centroids and expected-V logic for every bottle type.
-
-    # Defects are evaluated only after the bottle segmentation
-    # mask is available.
     result["defects"] = []
 
     return result
@@ -945,7 +1498,6 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
     if orientation_data is not None:
         local_orientation = dict(orientation_data)
 
-        # Draw actual bottle segmentation mask
         draw_mask_contour(
             image,
             local_orientation,
@@ -954,7 +1506,6 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
             fill=False
         )
 
-        # Draw orientation axes calculated from the mask
         draw_mask_orientation(
             image,
             local_orientation,
@@ -962,6 +1513,8 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
             3
         )
 
+    label_cx = None
+    label_cy = None
     if label_box is not None:
         lx1, ly1, lx2, ly2 = map(int, label_box)
         lx1 = max(0, min(lx1, w_img - 1))
@@ -1010,6 +1563,15 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
     status = "DEFECTIVE" if is_defective else "GOOD"
     status_color = defect_color if is_defective else bottle_color
 
+    # FIX 2: pixel-based centricity values on the saved annotation.
+    # Compute px offsets directly from the same centers drawn above,
+    # so the saved image and the on-screen value always match.
+    h_px_text = ""
+    v_px_text = ""
+    if label_cx is not None and label_cy is not None:
+        h_px_text = f" | {abs(label_cx - bottle_cx)}px"
+        v_px_text = f" | {abs(label_cy - bottle_cy)}px"
+
     lines = [
         f"Bottle #{track['id'] + 1}",
         f"Status: {status}",
@@ -1032,7 +1594,8 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
             )
             if track.get("final_h_value") is not None
             else (track.get("h_center") or "Pending")
-        ),
+        )
+        + h_px_text,
         "V Center: "
         + (
             format_measurement(
@@ -1041,7 +1604,8 @@ def draw_bottle_annotation(image, bottle_box, track, label_box=None, damage_boxe
             )
             if track.get("final_v_value") is not None
             else (track.get("v_center") or "Pending")
-        ),
+        )
+        + v_px_text,
         f"Defects: {', '.join(track['defects']) if track['defects'] else 'None'}",
         "Blue = orientation axes",
         "Orange = centricity",
@@ -1069,22 +1633,15 @@ def save_bottle_images(frame, track):
     if track["saved"]:
         return False
 
-    # Saving is only allowed for a finalized track.
     if not track.get("finalized", False):
         return False
 
-    # If a real defect was detected, save a frame that actually contains
-    # its bounding box. Otherwise use the best complete bottle frame.
-    # Always initialize this because a GOOD bottle may have no defect snapshot.
     saved_orientation_data = None
 
     if (
         track.get("best_complete_defect_frame") is not None
         and track.get("defects")
     ):
-        # Prefer a confirmed-defect frame that also contains the
-        # complete bottle. Defect boxes and mask data come from
-        # this exact same frame.
         frame = track["best_complete_defect_frame"]
         box = track["best_complete_defect_box"]
         saved_label_box = track.get(
@@ -1103,8 +1660,6 @@ def save_bottle_images(frame, track):
         )
 
     elif track["best_complete_frame"] is not None:
-        # For GOOD bottles, or when no complete defect snapshot exists,
-        # use the best complete bottle frame.
         frame = track["best_complete_frame"]
         box = track["best_complete_box"]
         saved_label_box = track.get("best_complete_label_box")
@@ -1119,11 +1674,8 @@ def save_bottle_images(frame, track):
         saved_orientation_data = track.get(
             "best_complete_orientation_data"
         )
-        # Keep the frozen final measurements. The selected frame is only
-        # used for the visual annotation; it must not change the final state.
 
     elif track.get("best_defect_frame") is not None and track.get("defects"):
-        # Last-resort fallback when no complete defect snapshot exists.
         frame = track["best_defect_frame"]
         box = track["best_defect_box"]
         saved_label_box = track.get("best_defect_label_box")
@@ -1138,9 +1690,6 @@ def save_bottle_images(frame, track):
         )
         return False
 
-    # If the chosen frame does not carry the defect boxes directly,
-    # reproject the confirmed defect location from bottle-relative
-    # coordinates onto this exact saved bottle box.
     bx1, by1, bx2, by2 = map(int, box)
     bw = max(1.0, float(bx2 - bx1))
     bh = max(1.0, float(by2 - by1))
@@ -1212,8 +1761,6 @@ def save_bottle_images(frame, track):
 
     if local_orientation_data is not None:
         contour = local_orientation_data.get("mask_contour")
-        # Convert full-frame orientation_data → crop-local coordinates HERE,
-        # so draw_bottle_annotation receives coords already in the crop space.
         local_orientation_data = dict(local_orientation_data)
         ocx, ocy = local_orientation_data["center"]
         local_orientation_data["center"] = (ocx - x1, ocy - y1)
@@ -1234,7 +1781,7 @@ def save_bottle_images(frame, track):
                 f"{local_pts[:, 0].max():.0f}, "
                 f"{local_pts[:, 1].max():.0f})"
             )
-            
+
     draw_bottle_annotation(
         annotated_crop,
         local_box,
@@ -1300,11 +1847,14 @@ def save_bottle_images(frame, track):
     print("=" * 40)
 
     category_dir = os.path.join(SAVE_DIR, category)
-    bottle_dir = os.path.join(category_dir, f"bottle_{track['id'] + 1:03d}")
-    os.makedirs(bottle_dir, exist_ok=True)
+    raw_dir = os.path.join(category_dir, "original")
+    annotated_dir = os.path.join(category_dir, "annotated")
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(annotated_dir, exist_ok=True)
 
-    original_path = os.path.join(bottle_dir, "original.jpg")
-    annotated_path = os.path.join(bottle_dir, "annotated.jpg")
+    bottle_filename = f"bottle_{track['id'] + 1:03d}_{EXPECTED_CAPACITY}ml.jpg"
+    original_path = os.path.join(raw_dir, bottle_filename)
+    annotated_path = os.path.join(annotated_dir, bottle_filename)
 
     original_saved = cv2.imwrite(original_path, original_crop)
     annotated_saved = cv2.imwrite(annotated_path, annotated_crop)
@@ -1337,16 +1887,6 @@ def save_bottle_images(frame, track):
 
 
 def get_matching_label_box(bottle_box, label_boxes):
-    """
-    Select the label that is spatially most consistent with the bottle.
-
-    Previously the first overlapping label was returned. If more than one
-    label candidate was present, that could associate the bottle with a
-    label from another region of the frame and produce a false H/V result.
-
-    The existing 10 px containment tolerance is preserved, and the selected
-    label is clipped to the bottle boundary before centricity is calculated.
-    """
     bx, by = box_center(bottle_box)
     candidates = []
 
@@ -1378,8 +1918,6 @@ def get_matching_label_box(bottle_box, label_boxes):
         bw = max(1.0, float(bottle_box[2] - bottle_box[0]))
         bh = max(1.0, float(bottle_box[3] - bottle_box[1]))
 
-        # Normalize the distance so it remains stable as the bottle
-        # changes apparent size while moving through the frame.
         distance = (
             ((lx - bx) / bw) ** 2
             + ((ly - by) / bh) ** 2
@@ -1396,21 +1934,36 @@ def get_matching_label_box(bottle_box, label_boxes):
     if not candidates:
         return None
 
-    # Closest label center wins; clipped area is the deterministic tie-breaker.
     candidates.sort(key=lambda item: (item[0], item[1]))
     return candidates[0][2]
 
 def update_centricity(track, bottle_box, label_boxes, seg_detections=None, bottle_mask=None, frame=None):
+    _t0 = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
+
+    # FIX 1: skip centricity update when the bottle box is not reliably
+    # inside the frame (e.g. first detected while still entering at the
+    # right edge). Edge-truncated boxes produce a skewed bottle centroid
+    # that poisons the offset history and causes spurious centricity FAILs.
+    if frame is not None and not is_reliable_bottle_frame(bottle_box, frame.shape):
+        return False
+
+    _s = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
     clipped_label_box = get_matching_label_box(bottle_box, label_boxes)
+    if ACTIVE_PROFILE_THIS_FRAME:
+        centricity_profile_times["label_box_match"] += time.perf_counter() - _s
     if clipped_label_box is None:
         return False
 
+    _s = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
     label_mask = (
         find_label_mask(bottle_box, seg_detections, frame)
         if seg_detections is not None and frame is not None
         else None
     )
+    if ACTIVE_PROFILE_THIS_FRAME:
+        centricity_profile_times["label_mask_lookup"] += time.perf_counter() - _s
 
+    _s = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
     (
         _h_status,
         _v_status,
@@ -1424,15 +1977,20 @@ def update_centricity(track, bottle_box, label_boxes, seg_detections=None, bottl
         bottle_mask=bottle_mask,
         label_mask=label_mask,
     )
+    if ACTIVE_PROFILE_THIS_FRAME:
+        centricity_profile_times["centroid_calculation"] += time.perf_counter() - _s
 
+    _s = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else None
     history = track.get("centricity_offset_history", [])
-    if len(history) >= CENTRICITY_MIN_HISTORY:
+    if len(history) >= 1:
         previous_h, previous_v = history[-1]
         if (abs(h_offset - previous_h) > CENTRICITY_SPATIAL_TOLERANCE or
                 abs(v_offset - previous_v) > CENTRICITY_SPATIAL_TOLERANCE):
             print(f"Bottle #{track['id'] + 1} centricity sudden jump ignored: "
                   f"offset=({h_offset:.3f}, {v_offset:.3f}), "
                   f"previous=({previous_h:.3f}, {previous_v:.3f})")
+            if ACTIVE_PROFILE_THIS_FRAME:
+                centricity_profile_times["history_and_status"] += time.perf_counter() - _s
             return False
 
     history.append((h_offset, v_offset))
@@ -1450,6 +2008,13 @@ def update_centricity(track, bottle_box, label_boxes, seg_detections=None, bottl
     track["h_center"] = h
     track["v_center"] = v
 
+    # Raw pixel offsets for on-screen / saved-image display (does not affect classification).
+    track["h_px_history"].append(abs(lx - bx))
+    track["v_px_history"].append(abs(ly - by))
+
+    if ACTIVE_PROFILE_THIS_FRAME:
+        centricity_profile_times["history_and_status"] += time.perf_counter() - _s
+
     print(f"Bottle #{track['id'] + 1} mask centricity updated: H={h}, V={v}, "
           f"mask_offset=({h_offset:.3f}, {v_offset:.3f}), "
           f"bottle_centroid=({bx:.1f}, {by:.1f}), "
@@ -1459,11 +2024,6 @@ def update_centricity(track, bottle_box, label_boxes, seg_detections=None, bottl
     return True
 
 def defect_on_bottle(defect_box, bottle_mask):
-    """
-    Return True only if a defect box overlaps the actual
-    bottle segmentation mask sufficiently.
-    """
-
     if bottle_mask is None:
         return False
 
@@ -1496,23 +2056,12 @@ def update_defects(
     orientation_data=None,
     bottle_mask=None,
 ):
-    """
-    Confirm defects only after they are detected in consecutive frames.
-
-    A single-frame defect prediction is treated as a possible false positive.
-    The defect is added to the bottle only after it remains valid for
-    DEFECT_CONFIRMATION_FRAMES consecutive frames.
-    """
-
     defects = set(track["defects"])
 
     current_mask = bottle_mask
 
     if current_mask is None:
         current_mask = track.get("_current_bottle_mask")
-    # ---------------------------------------------------------
-    # Check whether each defect type is valid in this frame
-    # ---------------------------------------------------------
     damage_valid = any(
         defect_on_bottle(dmg, current_mask)
         for dmg in damage_boxes
@@ -1523,13 +2072,6 @@ def update_defects(
         for bump in bump_boxes
     )
 
-    # ---------------------------------------------------------
-    # Update defect confirmation streaks
-    # Allow a short detector miss without immediately resetting
-    # the confirmation streak.
-    # ---------------------------------------------------------
-
-    # DAMAGE
     if damage_valid:
         track["defect_streaks"]["damage"] += 1
         track["defect_missing_frames"]["damage"] = 0
@@ -1544,8 +2086,6 @@ def update_defects(
                 track["defect_streaks"]["damage"] = 0
                 track["defect_missing_frames"]["damage"] = 0
 
-
-    # BUMP
     if bump_valid:
         track["defect_streaks"]["bump"] += 1
         track["defect_missing_frames"]["bump"] = 0
@@ -1560,9 +2100,6 @@ def update_defects(
                 track["defect_streaks"]["bump"] = 0
                 track["defect_missing_frames"]["bump"] = 0
 
-    # ---------------------------------------------------------
-    # Accept defect only after confirmation
-    # ---------------------------------------------------------
     if (
         track["defect_streaks"]["damage"]
         >= DEFECT_CONFIRMATION_FRAMES
@@ -1577,9 +2114,6 @@ def update_defects(
 
     track["defects"] = sorted(defects)
 
-    # ---------------------------------------------------------
-    # Preserve a frame that actually contains a CONFIRMED defect
-    # ---------------------------------------------------------
     confirmed_defect = (
         damage_valid
         and track["defect_streaks"]["damage"]
@@ -1595,8 +2129,6 @@ def update_defects(
         track["best_defect_box"] = bottle_box
         track["best_defect_label_box"] = label_box
 
-        # Only store the defect boxes that are actually valid
-        # against the bottle mask.
         track["best_defect_damage_boxes"] = [
             dmg for dmg in damage_boxes
             if defect_on_bottle(dmg, current_mask)
@@ -1607,9 +2139,6 @@ def update_defects(
             if defect_on_bottle(bump, current_mask)
         ]
 
-        # Keep normalized defect coordinates relative to the bottle box.
-        # This lets the annotation remain correct if the best saved
-        # complete frame is different from the exact defect frame.
         bx1, by1, bx2, by2 = map(int, bottle_box)
         bw = max(1.0, float(bx2 - bx1))
         bh = max(1.0, float(by2 - by1))
@@ -1636,9 +2165,6 @@ def update_defects(
 
         track["best_defect_orientation_data"] = orientation_data
 
-        # Also keep a confirmed-defect snapshot only when the complete
-        # bottle is inside the source frame. The defect boxes and mask
-        # data are then guaranteed to belong to the same frame.
         frame_h, frame_w = frame.shape[:2]
         dx1, dy1, dx2, dy2 = map(int, bottle_box)
 
@@ -1715,16 +2241,9 @@ def update_best_complete_detection(
 
     current_area = max(0, x2 - x1) * max(0, y2 - y1)
 
-    # Skip spurious/tiny detections.
     if current_area < MIN_BOTTLE_AREA:
         return
 
-    # A complete saved snapshot must keep the frame and its
-    # orientation/mask data together.
-    #
-    # If there is already a valid complete snapshot and the current
-    # frame has no segmentation mask, do not replace the existing
-    # snapshot with a frame that cannot provide mask visualization.
     if orientation_data is None and track.get("best_complete_frame") is not None:
         return
 
@@ -1746,7 +2265,6 @@ def update_best_complete_detection(
     if not should_update:
         return
 
-    # Store the frame and everything drawn on that frame together.
     track["best_complete_box"] = box
     track["best_complete_frame"] = frame.copy()
     track["best_complete_label_box"] = label_box
@@ -1828,7 +2346,6 @@ def update_best_valid_detection(
 
     if should_update:
         track["best_valid_box"] = box
-        # Do not retain another full-resolution frame per bottle.
         track["best_valid_frame"] = None
         track["annotation_label_box"] = label_box
         track["annotation_damage_boxes"] = list(damage_boxes or [])
@@ -1839,7 +2356,6 @@ def update_best_valid_detection(
 
 
 def should_save_bottle(track, frame_shape, force=False):
-    """A bottle is finalized only after it has disappeared from the stream."""
     if track["saved"] or track.get("finalized", False):
         return False
 
@@ -1887,8 +2403,6 @@ class FolderFrameSource:
             if os.path.splitext(name)[1].lower() in valid_extensions
         ]
 
-        # Natural filename sorting:
-        # frame_2 comes before frame_10
         self.frames.sort(
             key=lambda path: [
                 int(part) if part.isdigit() else part.lower()
@@ -1934,9 +2448,6 @@ class FolderFrameSource:
 # -----------------------------
 # Camera
 # -----------------------------
-# -----------------------------
-# Camera / Frame Source
-# -----------------------------
 
 h_cam = None
 
@@ -1966,6 +2477,114 @@ else:
 # -----------------------------
 # Main Loop
 # -----------------------------
+run_start_time = time.perf_counter()
+frames_processed = 0
+
+profiling_detection_time = 0.0
+profiling_segmentation_time = 0.0
+profiling_ocr_time = 0.0
+profiling_post_processing_time = 0.0
+
+ACTIVE_PROFILE_THIS_FRAME = False
+active_profile_frames = 0
+active_profile_times = {
+    "tracking_match": 0.0,
+    "mask_lookup": 0.0,
+    "orientation": 0.0,
+    "centricity": 0.0,
+    "defect_state": 0.0,
+    "snapshot_selection": 0.0,
+    "trigger": 0.0,
+    "ocr": 0.0,
+    "saving": 0.0,
+    "new_track": 0.0,
+    "visualization": 0.0,
+}
+
+ocr_variant_times = {
+    "variant1": 0.0,
+    "variants2_4_batch": 0.0,
+    "preprocessing": 0.0,
+    "parsing": 0.0,
+}
+ocr_variant_counts = {
+    "variant1": 0,
+    "variants2_4_batch": 0,
+}
+
+ocr_batch_v13 = {
+    "preprocessing": 0.0,
+    "batch_prepare": 0.0,
+    "inference": 0.0,
+    "parsing": 0.0,
+    "batch_calls": 0,
+    "images_total": 0,
+    "width_sum": 0,
+    "height_sum": 0,
+    "width_min": None,
+    "width_max": None,
+    "height_min": None,
+    "height_max": None,
+}
+
+ocr_call_diagnostics = {
+    "active_frames": 0,
+    "capacity_box_frames": 0,
+    "ocr_attempt_frames": 0,
+    "ocr_skipped_locked_frames": 0,
+    "ocr_no_capacity_box_frames": 0,
+    "valid_capacity_observations": 0,
+    "lock_activations": 0,
+    "tracks_seen": set(),
+    "track_ocr_calls": {},
+    "track_skipped_locked": {},
+}
+
+centricity_profile_times = {
+    "label_box_match": 0.0,
+    "label_mask_lookup": 0.0,
+    "centroid_calculation": 0.0,
+    "history_and_status": 0.0,
+}
+
+orientation_profile_times = {
+    "mask_pixels": 0.0,
+    "centering_mean": 0.0,
+    "centering_demean": 0.0,
+    "centering_covariance_ops": 0.0,
+    "centering_covariance": 0.0,
+    "eigen_angle": 0.0,
+    "projection_center": 0.0,
+    "projection_dot": 0.0,
+    "projection_max": 0.0,
+    "projection": 0.0,
+    "contour_prepare": 0.0,
+    "contour_find": 0.0,
+    "contour_select": 0.0,
+    "contour": 0.0,
+}
+
+
+def _profile_centricity_section(bucket, fn, *args, **kwargs):
+    if not ACTIVE_PROFILE_THIS_FRAME:
+        return fn(*args, **kwargs)
+    _t0 = time.perf_counter()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        centricity_profile_times[bucket] += time.perf_counter() - _t0
+
+
+def _profile_active_call(bucket, fn, *args, **kwargs):
+    global active_profile_times
+    if not ACTIVE_PROFILE_THIS_FRAME:
+        return fn(*args, **kwargs)
+    _t0 = time.perf_counter()
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        active_profile_times[bucket] += time.perf_counter() - _t0
+
 try:
     while True:
 
@@ -2026,10 +2645,24 @@ try:
                 else:
                     continue
 
-        detections = model.predict(frame, threshold=min(PER_CLASS_CONF.values()))
+        frame_start = time.perf_counter()
+        frames_processed += 1
+        # FIX: Active FPS timer now starts here (same point as Pipeline FPS),
+        # so it covers detection + segmentation + post-processing, not just
+        # post-processing. Previously it started after both TRT calls,
+        # which excluded the two most expensive ops and inflated Active FPS.
+        _active_processing_wall_start = frame_start
 
-        # Segmentation is used to obtain bottle/label masks for orientation and centricity.
-        seg_detections = seg_model.predict(frame, threshold=min(PER_CLASS_CONF.values()))
+        _profile_start = time.perf_counter()
+        detections = trt_predict(model, frame, min(PER_CLASS_CONF.values()))
+        profiling_detection_time += time.perf_counter() - _profile_start
+
+        _profile_start = time.perf_counter()
+        seg_detections = trt_predict(seg_model, frame, min(PER_CLASS_CONF.values()), keep_masks=True)
+        profiling_segmentation_time += time.perf_counter() - _profile_start
+
+        _post_processing_start = time.perf_counter()
+        _ocr_time_before_frame = profiling_ocr_time
 
         bottle_boxes = []
         capacity_boxes = []
@@ -2058,9 +2691,18 @@ try:
             cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(display, cls, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
+        ACTIVE_PROFILE_THIS_FRAME = bool(bottle_boxes)
+        if ACTIVE_PROFILE_THIS_FRAME:
+            active_profile_frames += 1
+        ocr_call_diagnostics["active_frames"] += 1
+
         for track in tracked:
             track["missing"] += 1
             track["frames_seen"] += 1
+
+        recently_saved_boxes = [(b, t - 1) for b, t in recently_saved_boxes if t > 1]
+
+        bottle_boxes = deduplicate_boxes(bottle_boxes, iou_thresh=0.65)
 
         for bottle in bottle_boxes:
             matched = False
@@ -2068,36 +2710,33 @@ try:
             for track in tracked:
                 if track.get("finalized", False) or track.get("saved", False):
                     continue
-                if bottle_track_match(bottle, track["box"]):
+                if _profile_active_call("tracking_match", bottle_track_match, bottle, track["box"]):
                     track["box"] = bottle
                     track["missing"] = 0
                     matched = True
+                    track["matched_frames"] = track.get("matched_frames", 0) + 1
 
                     current_area = max(0, bottle[2] - bottle[0]) * max(0, bottle[3] - bottle[1])
                     best_area = max(0, track["best_box"][2] - track["best_box"][0]) * max(0, track["best_box"][3] - track["best_box"][1])
                     if current_area > best_area:
                         track["best_box"] = bottle
-                        # Avoid retaining an additional full-resolution frame.
                         track["best_frame"] = None
 
-                    bottle_mask = find_bottle_mask(bottle, seg_detections)
+                    bottle_mask = _profile_active_call("mask_lookup", find_bottle_mask, bottle, seg_detections)
 
                     if bottle_mask is not None:
                         bottle_mask = resize_mask_to_frame(bottle_mask, frame)
                         bottle_mask = constrain_mask_to_box(bottle_mask, bottle)
 
-                        # Store the latest valid mask.
                         track["_current_bottle_mask"] = bottle_mask
 
-                        orientation_data = get_mask_orientation(bottle_mask)
+                        orientation_data = _profile_active_call("orientation", get_mask_orientation, bottle_mask)
 
                         if orientation_data is not None:
                             track["orientation_data"] = orientation_data
                             track["orientation"] = orientation_data["status"]
 
                     else:
-                        # Segmentation missed this frame.
-                        # Keep the previous valid mask and orientation data.
                         bottle_mask = track.get("_current_bottle_mask")
                         orientation_data = track.get("orientation_data")
 
@@ -2105,7 +2744,9 @@ try:
                     fh, fw = frame.shape[:2]
                     centricity_updated = False
 
-                    centricity_updated = update_centricity(
+                    centricity_updated = _profile_active_call(
+                        "centricity",
+                        update_centricity,
                         track,
                         bottle,
                         label_boxes,
@@ -2123,9 +2764,7 @@ try:
 
                     if track["orientation"] in {"PASS", "FAIL"}:
                         track["orientation_history"].append(track["orientation"])
-                    
-                    # Keep the numeric measurements that correspond to the
-                    # accepted observations used for final reporting.
+
                     if centricity_updated and track.get("centricity_offset_history"):
                         latest_h, latest_v = track["centricity_offset_history"][-1]
                         track["h_value_history"].append(float(latest_h))
@@ -2141,35 +2780,11 @@ try:
                     current_label_box = get_matching_label_box(bottle, label_boxes)
                     current_damage_boxes = [dmg for dmg in damage_boxes if dmg[0] >= bottle[0] and dmg[2] <= bottle[2] and dmg[1] >= bottle[1] and dmg[3] <= bottle[3]]
                     current_bump_boxes = [bump for bump in bump_boxes if bump[0] >= bottle[0] and bump[2] <= bottle[2] and bump[1] >= bottle[1] and bump[3] <= bottle[3]]
-                    # TEMPORARY DEBUG — Bottle #15 only
-                    if track["id"] + 1 == 15:
-                        print("\n========== BOTTLE #15 BUMP DEBUG ==========")
-                        print(f"Raw bump boxes: {len(bump_boxes)}")
-                        print(f"Current bump boxes: {len(current_bump_boxes)}")
-                        print(
-                            f"Bottle mask: "
-                            f"{track.get('_current_bottle_mask') is not None}"
-                        )
 
-                        for i, bump in enumerate(current_bump_boxes):
-                            valid = defect_on_bottle(
-                                bump,
-                                track.get("_current_bottle_mask")
-                            )
-                            print(
-                                f"Bump {i + 1}: "
-                                f"box={tuple(map(int, bump))}, "
-                                f"valid_on_bottle={valid}"
-                            )
-
-                        print(
-                            f"Bump streak: "
-                            f"{track['defect_streaks']['bump']}"
-                        )
-                        print("============================================")
-                    
                     previous_defects = set(track["defects"])
-                    update_defects(
+                    _profile_active_call(
+                        "defect_state",
+                        update_defects,
                         track,
                         bottle,
                         current_damage_boxes,
@@ -2181,11 +2796,20 @@ try:
                     )
                     defect_changed = set(track["defects"]) != previous_defects
 
-                    update_best_complete_detection(track, bottle, frame, label_box=current_label_box, damage_boxes=current_damage_boxes, bump_boxes=current_bump_boxes, force=defect_changed, orientation_data=orientation_data)
-                    update_best_valid_detection(
-                        track,
-                        bottle,
-                        frame,
+                    _profile_active_call(
+                        "snapshot_selection",
+                        update_best_complete_detection,
+                        track, bottle, frame,
+                        label_box=current_label_box,
+                        damage_boxes=current_damage_boxes,
+                        bump_boxes=current_bump_boxes,
+                        force=defect_changed,
+                        orientation_data=orientation_data,
+                    )
+                    _profile_active_call(
+                        "snapshot_selection",
+                        update_best_valid_detection,
+                        track, bottle, frame,
                         label_box=current_label_box,
                         damage_boxes=current_damage_boxes,
                         bump_boxes=current_bump_boxes,
@@ -2194,35 +2818,102 @@ try:
                         bottle_mask=bottle_mask,
                     )
 
-                    # Keep trying OCR while the bottle is visible.
-                    # Capacity is stabilized from repeated observations rather
-                    # than permanently locking on the first successful read.
                     observed_capacity = None
-                    _cap_tol = 15  # px tolerance for capacity box containment
+                    _cap_tol = 15
+                    track_id = track["id"]
+                    ocr_call_diagnostics["tracks_seen"].add(track_id)
+                    ocr_call_diagnostics["track_ocr_calls"].setdefault(track_id, 0)
+                    ocr_call_diagnostics["track_skipped_locked"].setdefault(track_id, 0)
 
-                    for cap_box in capacity_boxes:
+                    matching_capacity_boxes = [
+                        cap_box for cap_box in capacity_boxes
                         if (
                             cap_box[0] >= bottle[0] - _cap_tol
                             and cap_box[2] <= bottle[2] + _cap_tol
                             and cap_box[1] >= bottle[1] - _cap_tol
                             and cap_box[3] <= bottle[3] + _cap_tol
-                        ):
-                            cap = run_ocr(frame, cap_box)
+                        )
+                    ]
 
-                            if cap in {100, 300, 500}:
-                                observed_capacity = cap
-                                break
+                    if matching_capacity_boxes:
+                        ocr_call_diagnostics["capacity_box_frames"] += 1
+
+                    cap_box = matching_capacity_boxes[0] if matching_capacity_boxes else None
+                    completed_async = _poll_async_ocr(track, cap_box)
+
+                    if completed_async in {100, 300, 500}:
+                        observed_capacity = completed_async
+                        ocr_call_diagnostics["ocr_attempt_frames"] += 1
+                        ocr_call_diagnostics["track_ocr_calls"][track_id] += 1
+                        ocr_call_diagnostics["valid_capacity_observations"] += 1
+                        track["ocr_cached_capacity"] = completed_async
+                        if cap_box is not None:
+                            track["ocr_last_box"] = tuple(cap_box)
+                        track["ocr_cache_age"] = 0
+                        track["ocr_frames_since_inference"] = 0
+                        track["ocr_async_pending"] = False
+                    elif _ocr_future is not None and not _ocr_future.done():
+                        track["ocr_async_pending"] = True
+
+                    if track.get("ocr_capacity_locked", False):
+                        ocr_call_diagnostics["ocr_skipped_locked_frames"] += 1
+                        ocr_call_diagnostics["track_skipped_locked"][track_id] += 1
+                    elif cap_box is None:
+                        ocr_call_diagnostics["ocr_no_capacity_box_frames"] += 1
+                        track["ocr_cache_age"] = track.get("ocr_cache_age", 0) + 1
+                    else:
+                        cached_cap = track.get("ocr_cached_capacity")
+                        last_box = track.get("ocr_last_box")
+                        frames_since_ocr = track.get("ocr_frames_since_inference", 0)
+                        temporal_interval = max(1, int(track.get("ocr_temporal_interval", 3)))
+                        spatially_stable = (
+                            cached_cap in {100, 300, 500}
+                            and _ocr_box_is_still_compatible(last_box, cap_box)
+                        )
+                        force_temporal_refresh = frames_since_ocr >= (temporal_interval - 1)
+                        needs_refresh = (
+                            cached_cap not in {100, 300, 500}
+                            or not spatially_stable
+                            or force_temporal_refresh
+                        )
+
+                        if cached_cap in {100, 300, 500} and spatially_stable and not needs_refresh:
+                            observed_capacity = cached_cap
+                            track["ocr_cache_age"] = track.get("ocr_cache_age", 0) + 1
+                            track["ocr_frames_since_inference"] = frames_since_ocr + 1
+                        elif not track.get("ocr_async_pending", False):
+                            if _submit_async_ocr(track, frame, cap_box):
+                                track["ocr_async_pending"] = True
+                                track["ocr_last_box"] = tuple(cap_box)
+                                track["ocr_frames_since_inference"] = 0
+
+                        if observed_capacity is None and cached_cap in {100, 300, 500} and spatially_stable:
+                            observed_capacity = cached_cap
+                            track["ocr_cache_age"] = track.get("ocr_cache_age", 0) + 1
+                            track["ocr_frames_since_inference"] = frames_since_ocr + 1
 
                     if observed_capacity is not None:
                         track["capacity_history"].append(observed_capacity)
 
-                        stable_cap = stable_capacity(
-                            track["capacity_history"]
-                        )
+                        if observed_capacity == track.get("ocr_last_capacity"):
+                            track["ocr_same_capacity_count"] = track.get(
+                                "ocr_same_capacity_count", 0
+                            ) + 1
+                        else:
+                            track["ocr_last_capacity"] = observed_capacity
+                            track["ocr_same_capacity_count"] = 1
+
+                        stable_cap = stable_capacity(track["capacity_history"])
+
+                        if (
+                            track["ocr_same_capacity_count"] >= 3
+                            and not track.get("ocr_capacity_locked", False)
+                        ):
+                            track["ocr_capacity_locked"] = True
+                            ocr_call_diagnostics["lock_activations"] += 1
 
                         if stable_cap != track.get("capacity"):
                             track["capacity"] = stable_cap
-
                             print(
                                 f"Bottle #{track['id'] + 1} capacity updated: "
                                 f"{stable_cap} ml"
@@ -2264,15 +2955,68 @@ try:
                                     datetime.now().strftime('%H:%M:%S')
                                 ])
 
-                    trigger_crossed = has_crossed_trigger_line(
-                        track,
-                        bottle,
-                        frame.shape[1]
+                    trigger_crossed = _profile_active_call(
+                        "trigger",
+                        has_crossed_trigger_line,
+                        track, bottle, frame.shape[1]
                     )
 
                     break
 
             if not matched:
+                _dup_mask = find_bottle_mask(bottle, seg_detections)
+                if _dup_mask is not None:
+                    _dup_mask = resize_mask_to_frame(_dup_mask, frame)
+                    _dup_mask = constrain_mask_to_box(_dup_mask, bottle)
+                    for _et in tracked:
+                        if _et.get("finalized") or _et.get("saved"):
+                            continue
+                        if mask_iou(_dup_mask, _et.get("_current_bottle_mask")) > MASK_IOU_DUPLICATE_THRESH:
+                            print(
+                                f"[DUPLICATE-MASK] Bottle detection skipped — mask IoU "
+                                f"{mask_iou(_dup_mask, _et.get('_current_bottle_mask')):.2f} "
+                                f"with track #{_et['id'] + 1}"
+                            )
+                            matched = True
+                            break
+                else:
+                    _nx1, _ny1, _nx2, _ny2 = bottle[:4]
+                    _ncx, _ncy = (_nx1 + _nx2) / 2, (_ny1 + _ny2) / 2
+                    for _et in tracked:
+                        if _et.get("finalized") or _et.get("saved"):
+                            continue
+                        _ex1, _ey1, _ex2, _ey2 = _et["box"][:4]
+                        _ecx, _ecy = (_ex1 + _ex2) / 2, (_ey1 + _ey2) / 2
+                        _ew, _eh = _ex2 - _ex1, _ey2 - _ey1
+                        if (abs(_ncx - _ecx) < 0.25 * _ew and
+                                abs(_ncy - _ecy) < 0.25 * _eh):
+                            print(
+                                f"[DUPLICATE-BOX] Bottle detection skipped — center "
+                                f"({_ncx:.0f},{_ncy:.0f}) close to track #{_et['id']+1} "
+                                f"center ({_ecx:.0f},{_ecy:.0f})"
+                            )
+                            matched = True
+                            break
+
+                if matched:
+                    continue
+
+                _new_cx = (bottle[0] + bottle[2]) / 2
+                _is_ghost = False
+                if _new_cx < int(frame.shape[1] * TRIGGER_LINE_X_RATIO):
+                    for _sb, _ in recently_saved_boxes:
+                        _overlap = max(0, min(bottle[3], _sb[3]) - max(bottle[1], _sb[1]))
+                        _height = max(bottle[3] - bottle[1], _sb[3] - _sb[1], 1)
+                        if _overlap / _height > 0.70:
+                            _is_ghost = True
+                            print(
+                                f"[GHOST] Skipped re-detection of already-saved bottle "
+                                f"at ({int(bottle[0])},{int(bottle[1])},{int(bottle[2])},{int(bottle[3])})"
+                            )
+                            break
+                if _is_ghost:
+                    continue
+
                 bottle_count += 1
                 track = create_track(bottle)
                 track["best_frame"] = frame.copy()
@@ -2281,7 +3025,21 @@ try:
                 track["capacity"] = result["capacity"]
                 track["defects"] = result["defects"]
 
-                bottle_mask = find_bottle_mask(bottle, seg_detections)
+                _new_matching_capacity_boxes = [
+                    cap_box for cap_box in capacity_boxes
+                    if (
+                        cap_box[0] >= bottle[0] - 15
+                        and cap_box[2] <= bottle[2] + 15
+                        and cap_box[1] >= bottle[1] - 15
+                        and cap_box[3] <= bottle[3] + 15
+                    )
+                ]
+                if _new_matching_capacity_boxes:
+                    if _submit_async_ocr(track, frame, _new_matching_capacity_boxes[0]):
+                        track["ocr_async_pending"] = True
+                        track["ocr_last_box"] = tuple(_new_matching_capacity_boxes[0])
+
+                bottle_mask = _profile_active_call("mask_lookup", find_bottle_mask, bottle, seg_detections)
 
                 if bottle_mask is not None:
                     bottle_mask = resize_mask_to_frame(bottle_mask, frame)
@@ -2292,27 +3050,24 @@ try:
 
                     track["_current_bottle_mask"] = bottle_mask
 
-                    orientation_data = get_mask_orientation(bottle_mask)
+                    orientation_data = _profile_active_call("orientation", get_mask_orientation, bottle_mask)
 
                     if orientation_data is not None:
                         track["orientation_data"] = orientation_data
                         track["orientation"] = orientation_data["status"]
 
                 else:
-                    # No segmentation mask was available when the bottle first appeared.
                     track["_current_bottle_mask"] = None
                     orientation_data = None
 
                 initial_label_box = get_matching_label_box(bottle, label_boxes)
 
                 centricity_updated = False
-                centricity_updated = update_centricity(
-                    track,
-                    bottle,
-                    label_boxes,
+                centricity_updated = _profile_active_call(
+                    "centricity", update_centricity,
+                    track, bottle, label_boxes,
                     seg_detections=seg_detections,
-                    bottle_mask=bottle_mask,
-                    frame=frame,
+                    bottle_mask=bottle_mask, frame=frame,
                 )
 
                 if centricity_updated:
@@ -2356,15 +3111,10 @@ try:
                     and bump[3] <= bottle[3]
                 ]
 
-                # Evaluate initial defects against the actual
-                # bottle segmentation mask.
-                update_defects(
-                    track,
-                    bottle,
-                    initial_damage_boxes,
-                    initial_bump_boxes,
-                    frame=frame,
-                    label_box=initial_label_box,
+                _profile_active_call(
+                    "defect_state", update_defects,
+                    track, bottle, initial_damage_boxes, initial_bump_boxes,
+                    frame=frame, label_box=initial_label_box,
                     orientation_data=orientation_data,
                 )
 
@@ -2435,8 +3185,6 @@ try:
 
                 tracked.append(track)
 
-        # Finalize ONLY after the bottle has disappeared for the configured
-        # number of frames. While visible, its measurements continue to update.
         remaining_tracks = []
 
         for track in tracked:
@@ -2447,23 +3195,30 @@ try:
                         f"Bottle #{track['id'] + 1} crossed trigger line; "
                         f"finalizing stable result: {track['final_status']}"
                     )
-                    save_bottle_images(frame, track)
+                    _profile_active_call("saving", save_bottle_images, frame, track)
+                    recently_saved_boxes.append((track["box"], RECENTLY_SAVED_TTL))
 
             elif track["missing"] >= MAX_MISSING_FRAMES and not track["saved"]:
-                if should_save_bottle(track, frame.shape, force=True):
+                if track.get("matched_frames", 0) < MIN_MATCHED_FRAMES_TO_SAVE:
+                    print(
+                        f"Bottle #{track['id'] + 1} discarded: only matched "
+                        f"{track.get('matched_frames', 0)} frame(s) — "
+                        f"likely a false detection, not a real bottle."
+                    )
+                    track["saved"] = True  # drop silently, not counted
+                elif should_save_bottle(track, frame.shape, force=True):
                     print(
                         f"Bottle #{track['id'] + 1} disappeared; "
                         f"finalizing stable result: {track['final_status']}"
                     )
-                    save_bottle_images(frame, track)
+                    _profile_active_call("saving", save_bottle_images, frame, track)
 
-            # Once finalized/saved, remove the track immediately
-            # so no later frame can modify its final result.
             if not track["saved"]:
                 remaining_tracks.append(track)
 
         tracked = remaining_tracks
 
+        _active_visualization_start = time.perf_counter() if ACTIVE_PROFILE_THIS_FRAME else 0.0
         for track in tracked:
             if track["missing"] > 0:
                 continue
@@ -2559,6 +3314,8 @@ try:
                 if track.get("centricity_offset_history")
                 else None
             )
+            live_h_px = track["h_px_history"][-1] if track.get("h_px_history") else None
+            live_v_px = track["v_px_history"][-1] if track.get("v_px_history") else None
 
             info_lines = [
                 f"Status: {status}",
@@ -2575,19 +3332,15 @@ try:
                 ),
                 "H Center: "
                 + (
-                    format_measurement(
-                        live_h_value,
-                        track.get("h_center"),
-                    )
+                    format_measurement(live_h_value, track.get("h_center"))
+                    + (f" | {live_h_px:.0f}px" if live_h_px is not None else "")
                     if live_h_value is not None
                     else (track["h_center"] or "Pending")
                 ),
                 "V Center: "
                 + (
-                    format_measurement(
-                        live_v_value,
-                        track.get("v_center"),
-                    )
+                    format_measurement(live_v_value, track.get("v_center"))
+                    + (f" | {live_v_px:.0f}px" if live_v_px is not None else "")
                     if live_v_value is not None
                     else (track["v_center"] or "Pending")
                 ),
@@ -2598,9 +3351,12 @@ try:
                 line_color = status_color if line_index == 0 else (255, 255, 255)
                 cv2.putText(display, line, (x1 + 8, text_y + line_index * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, line_color, 2, cv2.LINE_AA)
 
+        if ACTIVE_PROFILE_THIS_FRAME:
+            active_profile_times["visualization"] = active_profile_times.get("visualization", 0.0) + (time.perf_counter() - _active_visualization_start)
+
         cv2.putText(
             display,
-            f"Completed: {completed_count} | Good: {good_count} | "
+            f"Total: {completed_count} | Good: {good_count} | "
             f"Defective: {defective_count} | Incomplete: {incomplete_count}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -2609,18 +3365,75 @@ try:
             2,
         )
 
+        _post_processing_elapsed = time.perf_counter() - _post_processing_start
+        _frame_ocr_time = profiling_ocr_time - _ocr_time_before_frame
+        profiling_post_processing_time += max(
+            0.0,
+            _post_processing_elapsed - _frame_ocr_time,
+        )
+
+        frame_elapsed = time.perf_counter() - frame_start
+        if frame_elapsed > 0:
+            instant_fps = 1.0 / frame_elapsed
+            fps = instant_fps if fps == 0.0 else (0.9 * fps + 0.1 * instant_fps)
+        resource_monitor.update()
+
+        # Print both FPS values to the terminal (not just on-screen),
+        # throttled to once every 30 frames to avoid log spam.
+        if frames_processed % 30 == 0:
+            print(
+                f"[FPS] Pipeline: {fps:.1f} | Active(bottle-present): {active_fps:.1f}"
+            )
+
+        # FIX 3 (clarity only): explicit labels — "PipelineFPS" is the
+        # whole-loop FPS (every frame, bottle or not); "ActiveFPS" is the
+        # smoothed FPS measured only across frames containing a bottle.
+        # Same two numbers as before, clearer labels so they read as
+        # genuinely different metrics rather than duplicates.
+        _active_fps_text = f" | ActiveFPS: {active_fps:.1f}" if active_fps > 0 else " | ActiveFPS: N/A"
+        cv2.putText(
+            display,
+            resource_monitor.text(fps).replace("FPS:", "PipelineFPS:") + _active_fps_text,
+            (10, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
         display_resized = cv2.resize(display, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
         cv2.imshow("Frosch Inference", display_resized)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
+        if ACTIVE_PROFILE_THIS_FRAME:
+            _active_total_elapsed = time.perf_counter() - _active_processing_wall_start
+            active_profile_times["_total_active_wall"] = active_profile_times.get("_total_active_wall", 0.0) + _active_total_elapsed
+            if _active_total_elapsed > 0:
+                _inst_active_fps = 1.0 / _active_total_elapsed
+                active_fps = _inst_active_fps if active_fps == 0.0 else (0.9 * active_fps + 0.1 * _inst_active_fps)
+            ACTIVE_PROFILE_THIS_FRAME = False
+
 except KeyboardInterrupt:
     print("Stopped by user.")
 
 finally:
+    total_runtime = time.perf_counter() - run_start_time
+    average_fps = frames_processed / total_runtime if total_runtime > 0 else 0.0
+
     for track in tracked:
-        if not track["saved"] and track.get("best_complete_frame") is not None:
+        if track["saved"]:
+            continue
+        if track.get("matched_frames", 0) < MIN_MATCHED_FRAMES_TO_SAVE:
+            print(
+                f"Bottle #{track['id'] + 1} discarded at shutdown: only matched "
+                f"{track.get('matched_frames', 0)} frame(s) — "
+                f"likely a false detection, not a real bottle."
+            )
+            continue
+        if track.get("best_complete_frame") is not None:
             if should_save_bottle(track, (0, 0), force=True):
                 save_bottle_images(track["best_complete_frame"], track)
 
@@ -2638,4 +3451,12 @@ finally:
     if h_cam is not None:
         h_cam.reset()
 
+    if _ocr_future is not None and not _ocr_future.done():
+        try:
+            _ocr_future.result()
+        except Exception as exc:
+            print(f"[WARNING] Async OCR shutdown: {exc}")
+    _ocr_executor.shutdown(wait=True)
+
+    resource_monitor.close()
     cv2.destroyAllWindows()

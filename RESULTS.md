@@ -2,57 +2,39 @@
 
 ## 1. Purpose
 
-This document records observed runtime behavior of the final Frosch live-inspection pipeline.
+This document records observed runtime behavior of the Frosch live-inspection pipeline (`live_inference.py`).
 
-These are **runtime inspection counts**, not formal model-accuracy metrics. Formal accuracy requires manually verified ground truth for each bottle and comparison against the system's final result.
+These are **runtime inspection counts**, not formal model-accuracy metrics. Formal accuracy requires manually verified ground truth for each bottle.
 
 ## 2. Final Validation Runs
 
-Final recorded frame-folder validation was performed on **21 August 2026** for all three supported bottle capacities.
+Final recorded frame-folder validation was performed on **31 August 2026** for all three supported bottle capacities using `live_inferenc.py`.
 
 | Bottle type | Frame folder | Frames | GOOD | DEFECTIVE | INCOMPLETE | Total |
 |---|---|---:|---:|---:|---:|---:|
-| 500 ml | `Capture_2026-07-15_07h31m58s` | 2,760 | 45 | 3 | 5 | 53 |
-| 300 ml | `Capture_2026-07-15_07h50m00s` | 1,270 | 8 | 7 | 0 | 15 |
-| 100 ml | `Capture_2026-07-15_07h53m14s` | 1,292 | 14 | 6 | 0 | 20 |
-
-These totals are the final runtime results emitted by the current inference script for the three validation runs.
+| 500 ml | `Capture_2026-07-15_07h31m58s` | 2,760 | 25 | 2 | 2 | 29 |
+| 300 ml | `Capture_2026-07-15_07h50m00s` | 1,270 | 6 | 4 | 0 | 10 |
+| 100 ml | `Capture_2026-07-15_07h53m14s` | 1,292 | 9 | 4 | 0 | 13 |
 
 ### 500 ml final counts
 
 ```text
-Total: 53 | Good: 45 | Defective: 3 | Incomplete: 5
+Total: 29 | Good: 25 | Defective: 2 | Incomplete: 2
 ```
 
 ### 300 ml final counts
 
 ```text
-Total: 15 | Good: 8 | Defective: 7 | Incomplete: 0
+Total: 10 | Good: 6 | Defective: 4 | Incomplete: 0
 ```
 
 ### 100 ml final counts
 
 ```text
-Total: 20 | Good: 14 | Defective: 6 | Incomplete: 0
+Total: 13 | Good: 9 | Defective: 4 | Incomplete: 0
 ```
 
-## 3. Interpretation
-
-The above counts represent bottles finalized by the runtime pipeline during recorded validation runs.
-
-They should **not** be interpreted as:
-
-- formal classification accuracy,
-- precision,
-- recall,
-- F1,
-- mAP,
-- defect rate,
-- or ground-truth correctness.
-
-A ground-truth evaluation set is required before those metrics can be reported.
-
-## 4. Observed Final-Result Behavior
+## 3. Observed Final-Result Behavior
 
 ### GOOD
 
@@ -66,29 +48,15 @@ Defects     : None
 Status      : GOOD
 ```
 
-The final 500 ml run included multiple GOOD examples with orientation values around 4–6 degrees and H/V values within the configured thresholds.
-
 ### DEFECTIVE — defect detection
 
-The runtime correctly records a bottle as DEFECTIVE when a confirmed bump or damage defect is present even when orientation and centricity pass.
-
-Examples in the final logs include:
+The runtime correctly records a bottle as DEFECTIVE when a confirmed bump or damage defect is present even when orientation and centricity pass. Example from the 100 ml run:
 
 ```text
-Orientation : 5.766 deg (PASS)
-H Center    : 0.093 (PASS)
-V Center    : 0.029 (PASS)
-Defects     : bump
-Status      : DEFECTIVE
-```
-
-and 100 ml examples such as:
-
-```text
-Orientation : 0.212 deg (PASS)
-H Center    : 0.029 (PASS)
-V Center    : 0.120 (PASS)
-Defects     : bump
+Orientation : 0.420 deg (PASS)
+H Center    : 0.011 (PASS)
+V Center    : 0.119 (PASS)
+Defects     : damage
 Status      : DEFECTIVE
 ```
 
@@ -96,11 +64,9 @@ Status      : DEFECTIVE
 
 A bottle can also be DEFECTIVE when an inspection measurement fails, even when no defect box is confirmed.
 
-This is separate from the defect-model path.
-
 ### INCOMPLETE
 
-An INCOMPLETE result is used when required measurements remain unavailable:
+An INCOMPLETE result is used when required measurements remain unavailable at finalization:
 
 ```text
 Orientation : Pending
@@ -110,102 +76,52 @@ Defects     : None
 Status      : INCOMPLETE
 ```
 
-The final 500 ml validation produced 5 INCOMPLETE bottles. These should be reviewed separately from DEFECTIVE bottles because missing measurements are not treated as physical defects.
+The 500 ml run produced 2 INCOMPLETE bottles. These are not treated as physical defects.
 
-## 5. Runtime Frame and Mask Information
-
-The three validation runs used recorded camera frames.
-
-The logs show:
+## 4. Runtime Frame and Mask Information
 
 - 500 ml run: 2,760 frames
 - 300 ml run: 1,270 frames
 - 100 ml run: 1,292 frames
 
-The camera frame resolution used by the final pipeline is:
+Camera frame resolution: `2048 × 2448`
+
+## 5. Trigger-Line Behavior
 
 ```text
-2048 x 2448
+TRIGGER_LINE_X_RATIO     = 0.40
+TRIGGER_LINE_TOLERANCE   = 20 px
 ```
 
-The bottle segmentation mask is resized to the same frame resolution before mask-based geometry is calculated.
+For the 2448-pixel-wide validation frames, the runtime trigger line is at approximately `x = 979`.
 
-## 6. Trigger-Line Behavior
-
-The final script uses:
+## 6. Defect Confirmation
 
 ```text
-TRIGGER_LINE_X_RATIO = 0.40
-TRIGGER_LINE_TOLERANCE = 20 px
+DEFECT_OVERLAP_THRESH        = 0.30
+DEFECT_CONFIRMATION_FRAMES   = 1
+DEFECT_MAX_MISSING_FRAMES    = 1
 ```
 
-For the 2448-pixel-wide validation frames, the runtime trigger line is reported at approximately:
+One-frame confirmation is intentional; some real defect detections are intermittent.
 
-```text
-x = 979
-```
-
-Crossing the line finalizes the bottle without waiting for the full missing-frame fallback.
-
-## 7. Defect Confirmation
-
-The final script uses:
-
-```text
-DEFECT_OVERLAP_THRESH = 0.30
-DEFECT_CONFIRMATION_FRAMES = 1
-DEFECT_MAX_MISSING_FRAMES = 1
-```
-
-A candidate defect must overlap the actual bottle segmentation mask sufficiently before it can affect the final result.
-
-The final pipeline intentionally uses one-frame confirmation because some real defect detections can be intermittent.
-
-## 8. Centricity Stabilization
-
-The runtime logs show the stabilization logic rejecting sudden label-position changes with messages such as:
-
-```text
-centricity sudden jump ignored
-```
-
-The current stabilization configuration is:
+## 7. Centricity Stabilization
 
 ```text
 CENTRICITY_SPATIAL_TOLERANCE = 0.08
-CENTRICITY_MIN_HISTORY = 3
-CENTRICITY_HISTORY_WINDOW = 5
+CENTRICITY_MIN_HISTORY       = 3
+CENTRICITY_HISTORY_WINDOW    = 5
 ```
 
-Final H/V values are taken from accumulated measurements rather than blindly using a single transient frame.
+Final H/V values are derived from accumulated measurements; sudden transient jumps are rejected with a log message.
 
-## 9. Capacity OCR
+## 8. Capacity OCR
 
-Capacity OCR supports:
+OCR supports 100 ml, 300 ml, and 500 ml. If OCR does not produce a valid result before finalization, `--expected-capacity` is used as a fallback.
 
-```text
-100 ml
-300 ml
-500 ml
-```
+## 9. CSV Output
 
-During a run, capacity may initially be unavailable:
-
-```text
-Capacity : Not detected ml
-```
-
-and become available later:
-
-```text
-Bottle #N capacity updated: 500 ml
-```
-
-The current finalization logic uses `--expected-capacity` as a fallback if OCR never produces a valid capacity for the track.
-
-## 10. CSV Output
-
-The final script creates a capacity-specific CSV at startup:
+The pipeline creates a capacity-specific CSV at startup:
 
 ```text
 results_100ml.csv
@@ -213,61 +129,52 @@ results_300ml.csv
 results_500ml.csv
 ```
 
-Columns:
+Columns: `Bottle`, `Capacity`, `Orientation`, `H_Center`, `V_Center`, `Defects`, `Timestamp`
 
-```text
-Bottle
-Capacity
-Orientation
-H_Center
-V_Center
-Defects
-Timestamp
-```
+## 10. Performance Optimization
 
-The CSV is intended for traceability and runtime result logging.
+### Observed FPS
 
-## 11. Validation Status
+| Condition | FPS range |
+|---|---|
+| Idle (no bottle in frame) | 83 – 96 FPS |
+| Active (bottle present, full pipeline) | 22 – 35 FPS |
 
-The final pipeline was exercised on all three supported bottle capacities:
+Active FPS includes dual TensorRT inference (detection + segmentation), mask geometry, centricity, defect validation, tracking, and image saving.
 
-- 500 ml
-- 300 ml
-- 100 ml
+### How Performance Was Achieved
 
-The final implementation includes:
+#### 1. Native TensorRT backend — single engine load at startup
 
-- bottle detection,
-- bottle segmentation,
-- bottle tracking,
-- capacity OCR,
-- capacity-specific H/V centricity references,
-- mask-based orientation,
-- defect validation against the bottle mask,
-- defect confirmation,
-- final GOOD/DEFECTIVE/INCOMPLETE classification,
-- complete-bottle saving,
-- annotated output preservation,
-- CSV logging.
+Both the RF-DETR detection engine (`rfdetr-medium.trt`, input 576×576) and the segmentation engine (`rfdetr-seg-medium.trt`, input 432×432) are loaded once at process startup and reused for every frame. There is no model reload per bottle or per frame.
 
-## 12. Formal Evaluation
+#### 2. Persistent CUDA buffers
 
-This document intentionally does not claim formal model accuracy metrics.
+GPU input/output buffers for each TensorRT engine are allocated once and reused across all frames (PERFORMANCE OPTIMIZATION 1 in the source). This eliminates per-frame GPU memory allocation and deallocation, which was a significant latency contributor in earlier versions.
 
-A formal project evaluation should compare, for every tested bottle:
+#### 3. Dedicated CUDA stream per engine
 
-| Bottle | Ground Truth | System Result | Correct? | Capacity Correct? | Orientation Correct? | H Correct? | V Correct? | Defect Correct? |
-|---|---|---|---|---|---|---|---|---|
+Each engine runs on its own non-default CUDA stream (`execute_async_v3`). This removes TensorRT's default-stream synchronization warning and allows cleaner stream management without cross-stream blocking.
 
-From that table, formal metrics can be calculated after manual review.
+#### 4. Async OCR via ThreadPoolExecutor
 
-## 13. Status
+EasyOCR is the slowest single operation in the pipeline (GPU-based text recognition). In the script it is submitted to a background `ThreadPoolExecutor(max_workers=1)` thread and polled non-blockingly each frame. OCR therefore runs in parallel with TensorRT inference and geometry processing rather than blocking the main loop. This was the primary change that moved active FPS from ~4–10 FPS (earlier versions with synchronous OCR) to the 22–35 FPS range observed.
+#### 5. TensorRT engines initialized once
 
-The final live pipeline is implemented and has been validated with recorded runs for all three supported bottle types.
+Both engines are constructed before the frame loop begins and shared across all bottles processed during a run. There is no lazy or per-bottle initialization.
 
-The results document distinguishes:
+### Summary of Gains
 
-- verified runtime behavior,
-- observed validation counts,
-- implementation behavior,
-- and formal metrics that require a separate ground-truth evaluation.
+| Optimization | Impact |
+|---|---|
+| Persistent CUDA buffers | Eliminates per-frame GPU alloc overhead |
+| Async OCR (ThreadPoolExecutor) | Primary bottleneck removed from critical path |
+| Single engine load + dedicated streams | Stable baseline, no reload latency |
+
+## 11. Formal Evaluation
+
+This document intentionally does not claim formal model accuracy metrics. A formal evaluation requires a manually verified ground-truth table per bottle (capacity, orientation, defect label) compared against the system's final result.
+
+## 12. Status
+
+The final live pipeline (`live_inference.py`) is implemented and has been validated with recorded runs for all three supported bottle types. Performance satisfies the active-FPS requirement demonstrated by the validation runs.
