@@ -1,0 +1,36 @@
+{
+  "artifact_id": "A11_trial",
+  "project": "FROSCH",
+  "timestamp_utc": "2026-09-08T11:02:14.680361+00:00",
+  "commit": "trial",
+  "environment": "",
+  "duration_s": 120,
+  "total_frames": 2423,
+  "fail_frame_ratio": 0.1,
+  "memory": {
+    "first_tenth_peak_mb": 1072.07,
+    "final_tenth_peak_mb": 1110.23,
+    "growth_mb_M3": 38.16,
+    "peak_rss_mb": 1110.23,
+    "ceiling_mb": 2048.0,
+    "note": "D4 growth gate not enforced in --trial mode (window too short)"
+  },
+  "latency": {
+    "p95_ms": 19.954,
+    "max_ms": 43.2,
+    "budget_ms": 100.0
+  },
+  "throughput": {
+    "fps": 20.192,
+    "min_required_fps": 25.0
+  },
+  "leak_reports": "see_lsan_valgrind_log",
+  "recovery": "see_recovery_check_json",
+  "gates": {
+    "D4_memory_growth": true,
+    "memory_ceiling": true,
+    "latency_p95": true,
+    "throughput": false
+  },
+  "overall_pass": false
+}

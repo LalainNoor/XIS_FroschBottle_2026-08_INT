@@ -1,0 +1,542 @@
+{
+  "artifact_id": "A12",
+  "project": "FROSCH",
+  "timestamp_utc": "2026-09-09T10:18:54.329515+00:00",
+  "commit": "3df16e135e83c1008eedefe02114e98f426eab47",
+  "files_audited": [
+    "live_inference.py"
+  ],
+  "missing_files": [],
+  "failure_paths": [
+    {
+      "file": "live_inference.py",
+      "line": 14,
+      "except_type": "ImportError",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 3439,
+      "except_type": "KeyboardInterrupt",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 351,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 800,
+      "except_type": "Exception",
+      "behaviour": "None",
+      "verdict": "OK \u2014 raises or returns absent status"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 531,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 787,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 794,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 3496,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 493,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 512,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 549,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 2598,
+      "except_type": "StopIteration",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 2602,
+      "except_type": "RuntimeError",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    },
+    {
+      "file": "live_inference.py",
+      "line": 2659,
+      "except_type": "Exception",
+      "behaviour": "no explicit return (falls through)",
+      "verdict": "REVIEW \u2014 check for prohibited substitution"
+    }
+  ],
+  "prohibited_patterns_found": [
+    {
+      "pattern_id": "P1",
+      "description": "except/except Exception returning 0 / None / constant as measurement",
+      "file": "live_inference.py",
+      "line": 787,
+      "snippet": "except Exception as exc:"
+    },
+    {
+      "pattern_id": "P1",
+      "description": "except/except Exception returning 0 / None / constant as measurement",
+      "file": "live_inference.py",
+      "line": 794,
+      "snippet": "except Exception as exc:"
+    },
+    {
+      "pattern_id": "P1",
+      "description": "except/except Exception returning 0 / None / constant as measurement",
+      "file": "live_inference.py",
+      "line": 800,
+      "snippet": "except Exception as exc:"
+    },
+    {
+      "pattern_id": "P2",
+      "description": "bare except: pass (swallows failure silently)",
+      "file": "live_inference.py",
+      "line": 512,
+      "snippet": "except Exception:"
+    },
+    {
+      "pattern_id": "P2",
+      "description": "bare except: pass (swallows failure silently)",
+      "file": "live_inference.py",
+      "line": 531,
+      "snippet": "except Exception:"
+    },
+    {
+      "pattern_id": "P2",
+      "description": "bare except: pass (swallows failure silently)",
+      "file": "live_inference.py",
+      "line": 549,
+      "snippet": "except Exception:"
+    },
+    {
+      "pattern_id": "P4",
+      "description": "accessing [0] on detections/contours inside try without prior length check",
+      "file": "live_inference.py",
+      "line": 2861,
+      "snippet": "cap_box = matching_capacity_boxes[0] if matching_capacity_boxes else None"
+    },
+    {
+      "pattern_id": "P4",
+      "description": "accessing [0] on detections/contours inside try without prior length check",
+      "file": "live_inference.py",
+      "line": 3058,
+      "snippet": "if _submit_async_ocr(track, frame, _new_matching_capacity_boxes[0]):"
+    },
+    {
+      "pattern_id": "P4",
+      "description": "accessing [0] on detections/contours inside try without prior length check",
+      "file": "live_inference.py",
+      "line": 3060,
+      "snippet": "track[\"ocr_last_box\"] = tuple(_new_matching_capacity_boxes[0])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1023,
+      "snippet": "class_names = segmentation_detections.data.get(\"class_name\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1054,
+      "snippet": "for i, cls in enumerate(seg_detections.data.get(\"class_name\", [])):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1057,
+      "snippet": "if float(seg_detections.confidence[i]) < PER_CLASS_CONF.get(\"label\", SEG_THRESHOLD):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1351,
+      "snippet": "for x in track.get(\"h_value_history\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1357,
+      "snippet": "for x in track.get(\"v_value_history\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1411,
+      "snippet": "track.get(\"orientation_history\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1413,
+      "snippet": "h_numeric = stable_numeric([abs(v) for v in track.get(\"h_value_history\", [])])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1414,
+      "snippet": "v_numeric = stable_numeric([abs(v) for v in track.get(\"v_value_history\", [])])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1420,
+      "snippet": "track.get(\"orientation_angle_history\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1637,
+      "snippet": "if not track.get(\"finalized\", False):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1651,
+      "snippet": "saved_damage_boxes = track.get("
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1655,
+      "snippet": "saved_bump_boxes = track.get("
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1667,
+      "snippet": "saved_damage_boxes = track.get("
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1671,
+      "snippet": "saved_bump_boxes = track.get("
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1683,
+      "snippet": "saved_damage_boxes = track.get(\"best_defect_damage_boxes\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1684,
+      "snippet": "saved_bump_boxes = track.get(\"best_defect_bump_boxes\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1699,
+      "snippet": "saved_bump_boxes = track.get(\"best_complete_bump_boxes\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1710,
+      "snippet": "in track.get(\"best_defect_bump_relative\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1714,
+      "snippet": "saved_damage_boxes = track.get("
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1728,
+      "snippet": "in track.get(\"best_defect_damage_relative\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 1985,
+      "snippet": "history = track.get(\"centricity_offset_history\", [])"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2360,
+      "snippet": "if track[\"saved\"] or track.get(\"finalized\", False):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2731,
+      "snippet": "if track.get(\"finalized\", False) or track.get(\"saved\", False):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2731,
+      "snippet": "if track.get(\"finalized\", False) or track.get(\"saved\", False):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2737,
+      "snippet": "track[\"matched_frames\"] = track.get(\"matched_frames\", 0) + 1"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2878,
+      "snippet": "if track.get(\"ocr_capacity_locked\", False):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2883,
+      "snippet": "track[\"ocr_cache_age\"] = track.get(\"ocr_cache_age\", 0) + 1"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2887,
+      "snippet": "frames_since_ocr = track.get(\"ocr_frames_since_inference\", 0)"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2888,
+      "snippet": "temporal_interval = max(1, int(track.get(\"ocr_temporal_interval\", 3)))"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2902,
+      "snippet": "track[\"ocr_cache_age\"] = track.get(\"ocr_cache_age\", 0) + 1"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2904,
+      "snippet": "elif not track.get(\"ocr_async_pending\", False):"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2912,
+      "snippet": "track[\"ocr_cache_age\"] = track.get(\"ocr_cache_age\", 0) + 1"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2919,
+      "snippet": "track[\"ocr_same_capacity_count\"] = track.get("
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2930,
+      "snippet": "and not track.get(\"ocr_capacity_locked\", False)"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2949,
+      "snippet": "track.get(\"orientation_angle_history\", [])[-1]"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2956,
+      "snippet": "else track.get(\"orientation\", \"Pending\")"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2964,
+      "snippet": "else track.get(\"h_center\", \"Pending\")"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 2972,
+      "snippet": "else track.get(\"v_center\", \"Pending\")"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3177,
+      "snippet": "track.get(\"orientation_angle_history\", [])[-1]"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3184,
+      "snippet": "else track.get(\"orientation\", \"Pending\")"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3192,
+      "snippet": "else track.get(\"h_center\", \"Pending\")"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3200,
+      "snippet": "else track.get(\"v_center\", \"Pending\")"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3212,
+      "snippet": "if track.get(\"trigger_crossed\", False) and not track[\"saved\"]:"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3222,
+      "snippet": "if track.get(\"matched_frames\", 0) < MIN_MATCHED_FRAMES_TO_SAVE:"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3225,
+      "snippet": "f\"{track.get('matched_frames', 0)} frame(s) \u2014 \""
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3375,
+      "snippet": "active_profile_times[\"visualization\"] = active_profile_times.get(\"visualization\", 0.0) + (time.perf_counter() - _active_visualization_start)"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3433,
+      "snippet": "active_profile_times[\"_total_active_wall\"] = active_profile_times.get(\"_total_active_wall\", 0.0) + _active_total_elapsed"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3451,
+      "snippet": "if track.get(\"matched_frames\", 0) < MIN_MATCHED_FRAMES_TO_SAVE:"
+    },
+    {
+      "pattern_id": "P5",
+      "description": ".get(key, <non-None default>) on config/measurement dict (hides missing config)",
+      "file": "live_inference.py",
+      "line": 3454,
+      "snippet": "f\"{track.get('matched_frames', 0)} frame(s) \u2014 \""
+    },
+    {
+      "pattern_id": "P6",
+      "description": "np.clip / min(max()) on a measurement result (clamps into range)",
+      "file": "live_inference.py",
+      "line": 378,
+      "snippet": "return 1.0 / (1.0 + np.exp(-np.clip(x, -88.0, 88.0)))"
+    },
+    {
+      "pattern_id": "P6",
+      "description": "np.clip / min(max()) on a measurement result (clamps into range)",
+      "file": "live_inference.py",
+      "line": 419,
+      "snippet": "xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], 0, w)"
+    },
+    {
+      "pattern_id": "P6",
+      "description": "np.clip / min(max()) on a measurement result (clamps into range)",
+      "file": "live_inference.py",
+      "line": 420,
+      "snippet": "xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0, h)"
+    }
+  ],
+  "prohibited_count": 61,
+  "overall_pass": false,
+  "verdict": "FAIL \u2014 61 prohibited pattern(s) found; see prohibited_patterns_found"
+}

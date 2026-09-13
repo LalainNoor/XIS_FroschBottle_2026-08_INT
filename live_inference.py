@@ -562,6 +562,7 @@ completed_count = 0
 good_count = 0
 defective_count = 0
 incomplete_count = 0
+skipped_frame_count = 0  # frames dropped due to unreadable file / fetch failure (§5.2 recovery)
 
 next_track_id = 0
 tracked = []
@@ -2598,52 +2599,71 @@ try:
                 print("All frames have been processed.")
                 break
 
+            except RuntimeError as exc:
+                # Corrupted/unreadable frame file (§5.2 recovery: report and
+                # resume, nothing silently substituted). FolderFrameSource.fetch()
+                # already advanced its internal index past the bad file, so the
+                # next loop iteration picks up the following frame.
+                skipped_frame_count += 1
+                print(f"[RECOVERY] Frame skipped (unreadable): {exc}", flush=True)
+                continue
+
         else:
 
-            with ia.fetch() as buffer:
-                component = buffer.payload.components[0]
-                width = component.width
-                height = component.height
-                pixel_format = component.data_format
-                data = component.data
+            try:
+                with ia.fetch() as buffer:
+                    component = buffer.payload.components[0]
+                    width = component.width
+                    height = component.height
+                    pixel_format = component.data_format
+                    data = component.data
 
-                if pixel_format == "Mono8":
-                    frame = data.reshape(height, width)
-                    frame = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_GRAY2BGR
-                    )
+                    if pixel_format == "Mono8":
+                        frame = data.reshape(height, width)
+                        frame = cv2.cvtColor(
+                            frame,
+                            cv2.COLOR_GRAY2BGR
+                        )
 
-                elif pixel_format == "RGB8":
-                    frame = data.reshape(height, width, 3)
-                    frame = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_RGB2BGR
-                    )
+                    elif pixel_format == "RGB8":
+                        frame = data.reshape(height, width, 3)
+                        frame = cv2.cvtColor(
+                            frame,
+                            cv2.COLOR_RGB2BGR
+                        )
 
-                elif pixel_format == "BGR8":
-                    frame = data.reshape(height, width, 3)
+                    elif pixel_format == "BGR8":
+                        frame = data.reshape(height, width, 3)
 
-                elif pixel_format in (
-                    "BayerRG8",
-                    "BayerGB8",
-                    "BayerGR8",
-                    "BayerBG8",
-                ):
-                    bayer_map = {
-                        "BayerRG8": cv2.COLOR_BayerRG2BGR,
-                        "BayerGB8": cv2.COLOR_BayerGB2BGR,
-                        "BayerGR8": cv2.COLOR_BayerGR2BGR,
-                        "BayerBG8": cv2.COLOR_BayerBG2BGR,
-                    }
+                    elif pixel_format in (
+                        "BayerRG8",
+                        "BayerGB8",
+                        "BayerGR8",
+                        "BayerBG8",
+                    ):
+                        bayer_map = {
+                            "BayerRG8": cv2.COLOR_BayerRG2BGR,
+                            "BayerGB8": cv2.COLOR_BayerGB2BGR,
+                            "BayerGR8": cv2.COLOR_BayerGR2BGR,
+                            "BayerBG8": cv2.COLOR_BayerBG2BGR,
+                        }
 
-                    frame = cv2.cvtColor(
-                        data.reshape(height, width),
-                        bayer_map[pixel_format],
-                    )
+                        frame = cv2.cvtColor(
+                            data.reshape(height, width),
+                            bayer_map[pixel_format],
+                        )
 
-                else:
-                    continue
+                    else:
+                        continue
+
+            except Exception as exc:
+                # Camera fetch/disconnect failure (§5.2 recovery: report and
+                # resume rather than crash the process). Not currently exercised
+                # in production since this deployment runs --input folder, but
+                # kept symmetric with the folder-mode handling above.
+                skipped_frame_count += 1
+                print(f"[RECOVERY] Camera frame fetch failed, skipping: {exc}", flush=True)
+                continue
 
         frame_start = time.perf_counter()
         frames_processed += 1
@@ -3423,6 +3443,8 @@ finally:
     total_runtime = time.perf_counter() - run_start_time
     average_fps = frames_processed / total_runtime if total_runtime > 0 else 0.0
 
+    discarded_incomplete_state = []  # (§5.2 recovery) tracks lost at shutdown w/ no salvage path
+
     for track in tracked:
         if track["saved"]:
             continue
@@ -3436,12 +3458,29 @@ finally:
         if track.get("best_complete_frame") is not None:
             if should_save_bottle(track, (0, 0), force=True):
                 save_bottle_images(track["best_complete_frame"], track)
+            else:
+                discarded_incomplete_state.append(track["id"] + 1)
+        else:
+            discarded_incomplete_state.append(track["id"] + 1)
+
+    if discarded_incomplete_state:
+        print(
+            f"[RECOVERY] {len(discarded_incomplete_state)} bottle(s) discarded at "
+            f"shutdown, in-flight state lost: "
+            f"{', '.join(f'#{n}' for n in discarded_incomplete_state)}"
+        )
+
+    if skipped_frame_count:
+        print(f"[RECOVERY] {skipped_frame_count} frame(s) skipped during this run "
+              f"due to read/fetch failure (see [RECOVERY] lines above for detail).")
 
     print("=" * 40)
     print("FINAL COUNTS")
     print(
         f"Total: {completed_count} | Good: {good_count} | "
-        f"Defective: {defective_count} | Incomplete: {incomplete_count}"
+        f"Defective: {defective_count} | Incomplete: {incomplete_count} | "
+        f"Discarded-at-shutdown: {len(discarded_incomplete_state)} | "
+        f"Frames-skipped: {skipped_frame_count}"
     )
     print("=" * 40)
 

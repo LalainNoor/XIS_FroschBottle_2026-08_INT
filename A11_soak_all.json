@@ -1,0 +1,56 @@
+{
+  "artifact_id": "A11",
+  "project": "FROSCH",
+  "timestamp_utc": "2026-09-10T08:38:39.827733+00:00",
+  "commit": "3df16e135e83c1008eedefe02114e98f426eab47",
+  "environment": "RTX 4090, Ubuntu 22.04, CUDA 12.4, TensorRT 10.x",
+  "expected_capacity_ml": [
+    100,
+    300,
+    500
+  ],
+  "frame_dirs": [
+    "/home/xisai/Downloads/Capture_2026-07-15_07h53m14s",
+    "/home/xisai/Downloads/Capture_2026-07-15_07h50m00s",
+    "/home/xisai/Downloads/Capture_2026-07-15_07h31m58s"
+  ],
+  "duration_s": 7200,
+  "total_frames": 213380,
+  "fail_frame_ratio": 0.1,
+  "memory": {
+    "baseline_rss_mb": 9638.102,
+    "first_tenth_peak_mb": 9710.574,
+    "final_tenth_peak_mb": 9702.34,
+    "growth_mb_M3": -8.234,
+    "median_growth_mb_supplementary": 0.664,
+    "peak_rss_mb": 9710.574,
+    "peak_growth_above_baseline_mb": 72.472,
+    "ceiling_mb": 2048.0,
+    "ceiling_gate_basis": "growth above post-preload baseline, not absolute RSS",
+    "note": ""
+  },
+  "vram": {
+    "baseline_mb": 14.855,
+    "growth_mb": 0.0,
+    "peak_mb": 14.855
+  },
+  "latency": {
+    "p95_ms": 30.885,
+    "max_ms": 111.935,
+    "budget_ms": 100.0
+  },
+  "throughput": {
+    "fps": 29.636,
+    "min_required_fps": 25.0
+  },
+  "leak_reports": "see_lsan_valgrind_log",
+  "recovery": "see_recovery_check_json",
+  "gates": {
+    "D4_memory_growth": true,
+    "memory_ceiling": true,
+    "latency_p95": true,
+    "latency_max": false,
+    "throughput": true
+  },
+  "overall_pass": false
+}

@@ -1,0 +1,49 @@
+{
+  "artifact_id": "A11_trial",
+  "project": "FROSCH",
+  "timestamp_utc": "2026-09-08T14:20:17.342818+00:00",
+  "commit": "trial",
+  "environment": "",
+  "expected_capacity_ml": [
+    100,
+    300,
+    500
+  ],
+  "frame_dirs": [
+    "/home/xisai/Downloads/Capture_2026-07-15_07h53m14s",
+    "/home/xisai/Downloads/Capture_2026-07-15_07h50m00s",
+    "/home/xisai/Downloads/Capture_2026-07-15_07h31m58s"
+  ],
+  "duration_s": 120,
+  "total_frames": 3568,
+  "fail_frame_ratio": 0.1,
+  "memory": {
+    "baseline_rss_mb": 9637.504,
+    "first_tenth_peak_mb": 9711.133,
+    "final_tenth_peak_mb": 9711.137,
+    "growth_mb_M3": 0.004,
+    "peak_rss_mb": 9711.137,
+    "peak_growth_above_baseline_mb": 73.633,
+    "ceiling_mb": 2048.0,
+    "ceiling_gate_basis": "growth above post-preload baseline, not absolute RSS",
+    "note": "D4 growth gate not enforced in --trial mode (window too short)"
+  },
+  "latency": {
+    "p95_ms": 28.875,
+    "max_ms": 73.586,
+    "budget_ms": 100.0
+  },
+  "throughput": {
+    "fps": 29.733,
+    "min_required_fps": 25.0
+  },
+  "leak_reports": "see_lsan_valgrind_log",
+  "recovery": "see_recovery_check_json",
+  "gates": {
+    "D4_memory_growth": true,
+    "memory_ceiling": true,
+    "latency_p95": true,
+    "throughput": true
+  },
+  "overall_pass": true
+}
